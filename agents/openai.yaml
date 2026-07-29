@@ -1,0 +1,4 @@
+interface:
+  display_name: "Govern AI Coding"
+  short_description: "Keep complex AI coding aligned with project facts."
+  default_prompt: "Use $govern-ai-coding to govern this complex AI coding change."
