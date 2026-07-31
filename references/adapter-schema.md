@@ -1,12 +1,15 @@
 # Adapter And Result Contract
 
-The adapter is JSON in V1. It stores pointers and rules, not current project
+The adapter is JSON with schema version 2. It stores pointers and rules, not current project
 facts.
 
 ## Adapter Fields
 
-- `schema_version`: string, currently `"1"`.
+- `schema_version`: string, currently `"2"`.
 - `project`: project or fixture identifier.
+- `navigation_entrypoint.path`: required and exactly `README.md`; this is the
+  common navigation starting point for humans and AI, not an implicit semantic
+  authority assignment.
 - `authority_rules`: list of rules.
 - `entrypoints.current`: current authority entrypoints.
 - `entrypoints.historical`: historical evidence entrypoints.
@@ -27,8 +30,19 @@ facts.
   classifications, task identity policy, decision-item pattern, current and
   historical attestation schemas, and generated-view markers.
 
-`entrypoints`, `boundaries`, and `human_approval` are required. `current` and
-`evidence` entrypoints must be non-empty lists. All path lists contain strings.
+`navigation_entrypoint`, `entrypoints`, `boundaries`, and `human_approval` are
+required. `current` and `evidence` entrypoints must be non-empty lists. All path
+lists contain strings. `README.md` must be covered by `ordinary_docs` and must
+not be covered by protected, excluded, or historical patterns. Do not add it to
+`entrypoints.current` unless a separate authority decision explicitly gives its
+content that role.
+
+Schema-1 adapters fail with `adapter-schema-migration-required`; they are never
+silently defaulted. Migrate by manually establishing the root README, adding
+the navigation object and ordinary-document coverage, removing boundary
+conflicts, setting schema 2, then running `validate-adapter --workspace` and
+`diagnose`. Existing schema-1 receipts remain readable but their adapter binding
+does not match a migrated schema-2 event.
 
 ## Authority Rule
 
@@ -74,8 +88,8 @@ human approval is `unproven`.
 
 The complete request, grant, preflight, task, amendment, receipt, lifecycle,
 result-normalization, and migration contracts are in
-[Controlled Archive Protocol](controlled-archive.md). Adapter schema remains
-`"1"` and all additions below are optional.
+[Controlled Archive Protocol](controlled-archive.md). Adapter schema is `"2"`;
+the controlled-archive additions below remain optional.
 
 ```json
 {
@@ -248,13 +262,17 @@ decision → request that decision.
 `diagnose <adapter> --workspace <path>` checks:
 
 - adapter structure;
+- exact root `README.md`, regular readable non-empty UTF-8 content, and
+  supported local links that remain within the workspace;
 - mapped authority targets;
 - current entrypoints;
 - evidence entrypoints;
 - configured plan-status conflicts;
 - local Markdown links in current authority documents.
 
-It does not crawl the whole repository.
+README navigation coverage is separate from current-authority link coverage.
+It does not crawl the whole repository, fetch external URLs, validate heading
+anchors, judge README correctness, or assign README semantic authority.
 
 ## Live Closeout
 
@@ -391,7 +409,7 @@ top-level approval type and emits a deprecation warning. A `human: true` rule
 with no candidate or several candidates fails adapter validation and Impact
 before edits. Use exactly one declared `human_approval_types` value. A
 historical path with no precise authority-rule mapping remains unresolved until
-the existing optional mapping is made precise. Adapter schema remains `"1"`.
+the existing optional mapping is made precise. Adapter schema remains `"2"`.
 
 ## Git-Aware Impact Inventory
 
@@ -598,7 +616,7 @@ Use `result_reasons` to understand why the result is not `pass`, then execute
 `recovery_actions` in order. `approval_summary` distinguishes exact required,
 verified, and missing semantic types. The existing `recovery` string is retained
 for callers that have not adopted the structured fields. These additions do not
-change adapter schema 1 or existing command syntax.
+further change adapter schema 2 or existing command syntax.
 
 ## Semantic Finding Contract
 

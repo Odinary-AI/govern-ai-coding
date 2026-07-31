@@ -123,6 +123,8 @@ EVENT_MANIFEST_SCHEMA = "govern-ai-coding.event-manifest.v1"
 CLOSEOUT_ATTESTATION_SCHEMA = "govern-ai-coding.closeout-attestation.v1"
 ARCHIVE_REQUEST_SCHEMA = "govern-ai-coding.archive-request.v1"
 ARCHIVE_RECEIPT_SCHEMA = "govern-ai-coding.archive-receipt.v1"
+ADAPTER_SCHEMA_VERSION = "2"
+NAVIGATION_ENTRYPOINT_PATH = "README.md"
 DEFAULT_INVENTORY_EXCLUDES = [
     ".git/",
     "node_modules/",
@@ -429,6 +431,62 @@ def make_semantic_finding(
     }
 
 
+def validate_navigation_entrypoint_config(adapter: dict) -> list[dict]:
+    findings: list[dict] = []
+    configured = adapter.get("navigation_entrypoint")
+    if not isinstance(configured, dict):
+        return [{
+            "code": "navigation-entrypoint-config-missing",
+            "field": "navigation_entrypoint",
+            "message": "navigation_entrypoint must be an object with path README.md",
+        }]
+    if configured.get("path") != NAVIGATION_ENTRYPOINT_PATH:
+        findings.append({
+            "code": "navigation-entrypoint-path-invalid",
+            "field": "navigation_entrypoint.path",
+            "path": configured.get("path"),
+            "message": "navigation_entrypoint.path must be exactly README.md",
+        })
+
+    boundaries = safe_section(adapter, "boundaries")
+    ordinary = (
+        boundaries.get("ordinary_docs", [])
+        if is_string_list(boundaries.get("ordinary_docs", []))
+        else []
+    )
+    if not any(
+        path_matches(NAVIGATION_ENTRYPOINT_PATH, pattern)
+        for pattern in ordinary
+    ):
+        findings.append({
+            "code": "navigation-entrypoint-boundary-missing",
+            "path": NAVIGATION_ENTRYPOINT_PATH,
+            "message": "README.md must be covered by boundaries.ordinary_docs",
+        })
+
+    conflicts: list[dict] = []
+    for field in ("protected", "excluded"):
+        patterns = boundaries.get(field, [])
+        if not is_string_list(patterns):
+            continue
+        for pattern in patterns:
+            if path_matches(NAVIGATION_ENTRYPOINT_PATH, pattern):
+                conflicts.append({"field": f"boundaries.{field}", "pattern": pattern})
+    historical = safe_section(adapter, "entrypoints").get("historical", [])
+    if is_string_list(historical):
+        for pattern in historical:
+            if path_matches(NAVIGATION_ENTRYPOINT_PATH, pattern):
+                conflicts.append({"field": "entrypoints.historical", "pattern": pattern})
+    if conflicts:
+        findings.append({
+            "code": "navigation-entrypoint-boundary-conflict",
+            "path": NAVIGATION_ENTRYPOINT_PATH,
+            "conflicts": conflicts,
+            "message": "README.md must not be protected, excluded, or historical",
+        })
+    return findings
+
+
 def validate_adapter(adapter: dict) -> dict:
     findings = []
     warnings = []
@@ -436,8 +494,19 @@ def validate_adapter(adapter: dict) -> dict:
     rules = raw_rules if isinstance(raw_rules, list) else []
     seen = set()
 
-    if adapter.get("schema_version") != "1":
-        findings.append({"code": "unsupported-schema-version", "message": "schema_version must be 1"})
+    schema_version = adapter.get("schema_version")
+    if schema_version == "1":
+        findings.append({
+            "code": "adapter-schema-migration-required",
+            "field": "schema_version",
+            "message": "schema_version 1 must be explicitly migrated to schema_version 2",
+        })
+    elif schema_version != ADAPTER_SCHEMA_VERSION:
+        findings.append({
+            "code": "unsupported-schema-version",
+            "field": "schema_version",
+            "message": f"schema_version must be {ADAPTER_SCHEMA_VERSION}",
+        })
 
     if not isinstance(adapter.get("project"), str) or not adapter.get("project"):
         add_type_finding(findings, "invalid-project", "project", "non-empty string")
@@ -505,6 +574,8 @@ def validate_adapter(adapter: dict) -> dict:
         value = boundaries.get(key)
         if not is_string_list(value):
             add_type_finding(findings, f"invalid-boundary-{key}", f"boundaries.{key}", "list of strings")
+
+    findings.extend(validate_navigation_entrypoint_config(adapter))
 
     human_approval = adapter.get("human_approval")
     if human_approval is None:
@@ -635,7 +706,24 @@ def extract_impact_receipt(payload: object) -> tuple[dict | None, list[dict]]:
 
 def validate_adapter_command(args: argparse.Namespace) -> None:
     adapter, missing = load_json_or_missing(Path(args.adapter))
-    emit(missing if missing else validate_adapter(adapter))
+    if missing:
+        emit(missing)
+        return
+    structural = validate_adapter(adapter)
+    if structural["result"] == "fail":
+        emit(structural)
+        return
+    if not args.workspace:
+        structural["result"] = "unproven"
+        structural["coverage"] = {
+            "unverified": ["navigation-entrypoint-workspace-required"],
+        }
+        structural["recovery"] = (
+            "Rerun validate-adapter with --workspace to verify the required root README.md."
+        )
+        emit(structural)
+        return
+    emit(validate_live_adapter(adapter, Path(args.workspace)))
 
 
 def work_map_command(args: argparse.Namespace) -> None:
@@ -643,7 +731,7 @@ def work_map_command(args: argparse.Namespace) -> None:
     if missing:
         emit(missing)
         return
-    validation = validate_adapter(adapter)
+    validation = validate_live_adapter(adapter, Path(args.workspace))
     if validation["result"] != "pass":
         emit(validation)
         return
@@ -849,6 +937,11 @@ def run_cases_command(args: argparse.Namespace) -> None:
 
 
 LINK_RE = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")
+REFERENCE_LINK_RE = re.compile(r"!?\[([^\]]+)\]\[([^\]]*)\]")
+REFERENCE_DEFINITION_RE = re.compile(
+    r"^\s{0,3}\[([^\]]+)\]:\s*(?:<([^>]+)>|(\S+))",
+    flags=re.MULTILINE,
+)
 
 
 def markdown_links(text: str) -> list[str]:
@@ -860,6 +953,16 @@ def markdown_links(text: str) -> list[str]:
         # Drop optional Markdown title after a whitespace separator.
         target = raw.split()[0]
         links.append(target.strip("<>"))
+    definitions: dict[str, str] = {}
+    for match in REFERENCE_DEFINITION_RE.finditer(text):
+        label = " ".join(match.group(1).split()).casefold()
+        target = match.group(2) or match.group(3)
+        definitions[label] = target.strip("<>")
+    for match in REFERENCE_LINK_RE.finditer(text):
+        label = match.group(2) or match.group(1)
+        normalized = " ".join(label.split()).casefold()
+        if normalized in definitions:
+            links.append(definitions[normalized])
     return links
 
 
@@ -871,8 +974,141 @@ def is_local_link(target: str) -> bool:
 
 
 def resolve_link(doc_path: Path, target: str) -> Path:
-    clean = unquote(target.split("#", 1)[0])
+    clean = unquote(urlparse(target).path)
     return (doc_path.parent / clean).resolve()
+
+
+def navigation_link_path(
+    workspace: Path,
+    doc_path: Path,
+    target: str,
+) -> tuple[Path | None, bool]:
+    clean = unquote(urlparse(target).path)
+    if not clean:
+        return None, False
+    lexical_workspace = Path(os.path.abspath(workspace))
+    lexical_target = Path(os.path.abspath(doc_path.parent / clean))
+    try:
+        lexical_target.relative_to(lexical_workspace)
+    except ValueError:
+        return lexical_target, True
+    resolved_workspace = workspace.resolve()
+    resolved_target = lexical_target.resolve()
+    try:
+        resolved_target.relative_to(resolved_workspace)
+    except ValueError:
+        return resolved_target, True
+    return resolved_target, False
+
+
+def validate_navigation_entrypoint_live(
+    adapter: dict,
+    workspace: Path,
+) -> tuple[dict, list[dict]]:
+    findings: list[dict] = []
+    link_check = {"checked": 0, "broken": 0, "outside_workspace": 0}
+    coverage = {
+        "path": NAVIGATION_ENTRYPOINT_PATH,
+        "role": "navigation",
+        "consumers": ["human", "ai"],
+        "project_authority": False,
+        "checked": True,
+        "link_check": link_check,
+    }
+    workspace = workspace.resolve()
+    try:
+        exact_entries = os.listdir(workspace)
+    except OSError as exc:
+        findings.append({
+            "code": "navigation-entrypoint-unreadable",
+            "path": NAVIGATION_ENTRYPOINT_PATH,
+            "reason": exc.__class__.__name__,
+            "message": "workspace could not be read while checking README.md",
+        })
+        return coverage, findings
+    if NAVIGATION_ENTRYPOINT_PATH not in exact_entries:
+        findings.append({
+            "code": "navigation-entrypoint-file-missing",
+            "path": NAVIGATION_ENTRYPOINT_PATH,
+            "message": "workspace root must contain an exact README.md entry",
+        })
+        return coverage, findings
+
+    readme = workspace / NAVIGATION_ENTRYPOINT_PATH
+    try:
+        mode = readme.lstat().st_mode
+    except OSError as exc:
+        findings.append({
+            "code": "navigation-entrypoint-unreadable",
+            "path": NAVIGATION_ENTRYPOINT_PATH,
+            "reason": exc.__class__.__name__,
+            "message": "README.md metadata could not be read",
+        })
+        return coverage, findings
+    if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
+        findings.append({
+            "code": "navigation-entrypoint-file-not-regular",
+            "path": NAVIGATION_ENTRYPOINT_PATH,
+            "message": "README.md must be a non-symlink regular file",
+        })
+        return coverage, findings
+
+    try:
+        text = readme.read_text(encoding="utf-8", errors="strict")
+    except (OSError, UnicodeDecodeError) as exc:
+        findings.append({
+            "code": "navigation-entrypoint-unreadable",
+            "path": NAVIGATION_ENTRYPOINT_PATH,
+            "reason": exc.__class__.__name__,
+            "message": "README.md must be readable strict UTF-8 text",
+        })
+        return coverage, findings
+    if not text.lstrip("\ufeff").strip():
+        findings.append({
+            "code": "navigation-entrypoint-empty",
+            "path": NAVIGATION_ENTRYPOINT_PATH,
+            "message": "README.md must contain non-whitespace navigation content",
+        })
+        return coverage, findings
+
+    for target in markdown_links(text):
+        if not is_local_link(target):
+            continue
+        resolved, outside = navigation_link_path(workspace, readme, target)
+        if resolved is None:
+            continue
+        link_check["checked"] += 1
+        if outside:
+            link_check["outside_workspace"] += 1
+            findings.append({
+                "code": "navigation-entrypoint-link-outside-workspace",
+                "path": NAVIGATION_ENTRYPOINT_PATH,
+                "target": target,
+                "message": "README.md local link must remain inside the workspace",
+            })
+        elif not resolved.exists():
+            link_check["broken"] += 1
+            findings.append({
+                "code": "navigation-entrypoint-link-broken",
+                "path": NAVIGATION_ENTRYPOINT_PATH,
+                "target": target,
+                "message": "README.md local link target does not exist",
+            })
+    return coverage, findings
+
+
+def validate_live_adapter(adapter: dict, workspace: Path) -> dict:
+    result = validate_adapter(adapter)
+    if result["result"] == "fail":
+        return result
+    coverage, findings = validate_navigation_entrypoint_live(adapter, workspace)
+    result["navigation_entrypoint"] = coverage
+    result["mechanical_findings"].extend(findings)
+    result["result"] = "fail" if result["mechanical_findings"] else "pass"
+    result["recovery"] = (
+        "Live adapter validation checked structure and the required root navigation entrypoint."
+    )
+    return result
 
 
 def current_authority_docs(adapter: dict, workspace: Path) -> list[Path]:
@@ -953,7 +1189,7 @@ def check_plan_status(adapter: dict, workspace: Path) -> list[dict]:
 
 
 def diagnose(adapter: dict, workspace: Path) -> dict:
-    adapter_result = validate_adapter(adapter)
+    adapter_result = validate_live_adapter(adapter, workspace)
     findings = list(adapter_result["mechanical_findings"])
 
     checked_targets = set()
@@ -1011,6 +1247,7 @@ def diagnose(adapter: dict, workspace: Path) -> dict:
             "current_authority_docs": len(current_authority_docs(adapter, workspace)),
             "proves": [
                 "adapter structure",
+                "required README.md navigation for humans and AI",
                 "mapped authority targets",
                 "current and evidence entrypoints",
                 "configured plan status checks",
@@ -1027,6 +1264,7 @@ def diagnose(adapter: dict, workspace: Path) -> dict:
             "broken": broken,
             "scope": "current authority markdown only",
         },
+        "navigation_entrypoint": adapter_result.get("navigation_entrypoint", {}),
         "mechanical_findings": findings,
         "semantic_findings": [],
         "human_approval_required": [],
@@ -1459,7 +1697,11 @@ def impact_command(args: argparse.Namespace) -> None:
         emit(missing)
         return
 
-    adapter_result = validate_adapter(adapter)
+    adapter_result = (
+        validate_live_adapter(adapter, Path(args.workspace))
+        if args.workspace
+        else validate_adapter(adapter)
+    )
     if adapter_result["result"] == "fail":
         emit({
             "result": "fail",
@@ -3482,7 +3724,7 @@ def controlled_archive_command(args: argparse.Namespace) -> None:
             recovery="Provide one adapter JSON object; no file was moved.",
         ))
         return
-    adapter_result = validate_adapter(adapter)
+    adapter_result = validate_live_adapter(adapter, Path(args.workspace))
     if adapter_result["result"] != "pass":
         emit({
             "result": "fail",
@@ -3875,7 +4117,7 @@ def archive_task_command(args: argparse.Namespace) -> None:
             "recovery": "Provide one adapter JSON object; no file was moved.",
         })
         return
-    adapter_result = validate_adapter(adapter)
+    adapter_result = validate_live_adapter(adapter, Path(args.workspace))
     if adapter_result["result"] != "pass":
         emit({
             "result": "fail",
@@ -4285,6 +4527,20 @@ def archive_authorization_status_command(args: argparse.Namespace) -> None:
     if missing:
         emit(missing)
         return
+    validation = validate_live_adapter(adapter, Path(args.workspace))
+    if validation["result"] != "pass":
+        emit({
+            "result": "fail",
+            "mechanical_findings": validation["mechanical_findings"],
+            "semantic_findings": [],
+            "human_approval_required": [],
+            "authorization_lifecycle": None,
+            "recovery": (
+                "Fix adapter and root navigation entrypoint findings before "
+                "reading archive authorization lifecycle status."
+            ),
+        })
+        return
     payload = archive_authorization_lifecycle(
         adapter,
         Path(args.workspace).resolve(),
@@ -4325,7 +4581,7 @@ def freeze_command(args: argparse.Namespace) -> None:
         missing["freeze_receipt"] = None
         emit(missing)
         return
-    adapter_result = validate_adapter(adapter)
+    adapter_result = validate_live_adapter(adapter, Path(args.workspace))
     if adapter_result["result"] == "fail":
         emit({
             "result": "fail",
@@ -5617,7 +5873,7 @@ def live_closeout(
     human_approval_bindings: list[str],
     args: argparse.Namespace | None = None,
 ) -> dict:
-    adapter_result = validate_adapter(adapter)
+    adapter_result = validate_live_adapter(adapter, workspace)
     mechanical = list(adapter_result["mechanical_findings"])
     path_warnings: list[dict] = []
     human_required = []
@@ -6095,6 +6351,47 @@ def diagnostic_category(code: str) -> str:
 
 
 def diagnostic_recovery(code: str, category: str) -> str:
+    navigation_recovery = {
+        "adapter-schema-migration-required": (
+            "Migrate explicitly to schema_version 2, declare navigation_entrypoint.path as README.md, "
+            "cover README.md with boundaries.ordinary_docs, then validate with --workspace."
+        ),
+        "navigation-entrypoint-config-missing": (
+            "Declare navigation_entrypoint as an object with path README.md; do not add an implicit authority rule."
+        ),
+        "navigation-entrypoint-path-invalid": (
+            "Set navigation_entrypoint.path to the exact root-relative value README.md."
+        ),
+        "navigation-entrypoint-boundary-missing": (
+            "Add README.md to boundaries.ordinary_docs and retain normal event authorization."
+        ),
+        "navigation-entrypoint-boundary-conflict": (
+            "Remove README.md from protected, excluded, and historical coverage while preserving ordinary_docs coverage."
+        ),
+        "navigation-entrypoint-workspace-required": (
+            "Rerun the command with --workspace pointing to the exact governed workspace; no file was changed."
+        ),
+        "navigation-entrypoint-file-missing": (
+            "Manually create the approved root README.md content, then rerun live validation; do not generate project facts automatically."
+        ),
+        "navigation-entrypoint-file-not-regular": (
+            "Replace the root entry with a non-symlink regular README.md after explicit project-authorized editing."
+        ),
+        "navigation-entrypoint-unreadable": (
+            "Make README.md readable strict UTF-8 without changing its claims automatically, then rerun live validation."
+        ),
+        "navigation-entrypoint-empty": (
+            "Add human-approved navigation content to README.md through the normal governed edit workflow."
+        ),
+        "navigation-entrypoint-link-broken": (
+            "Correct or remove the exact broken local README.md link through an authorized governed edit."
+        ),
+        "navigation-entrypoint-link-outside-workspace": (
+            "Change the local README.md link to a destination inside the governed workspace."
+        ),
+    }
+    if code in navigation_recovery:
+        return navigation_recovery[code]
     if category == "adapter_configuration":
         return "Correct the adapter field or mapping before continuing the event."
     if category == "receipt_format":
@@ -6117,7 +6414,7 @@ def diagnostic_recovery(code: str, category: str) -> str:
 def diagnostic_context(item: dict) -> tuple[dict, list[str]]:
     fields = {
         key: item[key]
-        for key in ("field", "type", "evidence")
+        for key in ("field", "type", "evidence", "target", "reason")
         if key in item
     }
     paths: list[str] = []
@@ -6433,6 +6730,44 @@ def closeout_command(args: argparse.Namespace) -> None:
             }
             emit(add_structured_closeout_recovery(missing))
             return
+        live_validation = validate_live_adapter(adapter, Path(args.workspace))
+        if live_validation["result"] != "pass":
+            emit(add_structured_closeout_recovery({
+                "result": "fail",
+                "coverage": {
+                    "workspace_mode": "live",
+                    "unverified": ["closeout-not-run"],
+                },
+                "closeout": {
+                    "mode": "live",
+                    "workspace": args.workspace,
+                    "changed_paths": args.changed_path,
+                    "actual_paths": args.actual_path,
+                    "authorized_docs": args.authorized_paths,
+                    "authorized_paths": args.authorized_paths,
+                    "protected_approvals": [],
+                    "verified_human_approvals": [],
+                },
+                "mechanical_findings": live_validation["mechanical_findings"],
+                "semantic_review": {
+                    "status": "not run",
+                    "required": bool(args.require_semantic_review),
+                    "findings": [],
+                },
+                "semantic_findings": [],
+                "human_approval_required": [],
+                "closeout_receipt": None,
+                "receipt_output": None,
+                "attestation": {
+                    "status": "not-created",
+                    "reason": "live-adapter-validation-failed",
+                },
+                "recovery": (
+                    "Fix adapter and root navigation entrypoint findings before "
+                    "Closeout; no receipt or attestation was written."
+                ),
+            }))
+            return
         payload = live_closeout(
             adapter,
             Path(args.workspace),
@@ -6569,11 +6904,23 @@ def closeout_command(args: argparse.Namespace) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="govern-ai-coding deterministic checker")
+    parser = argparse.ArgumentParser(
+        description=(
+            "govern-ai-coding deterministic checker with required root "
+            "README.md navigation for humans and AI"
+        )
+    )
     sub = parser.add_subparsers(required=True)
 
-    validate = sub.add_parser("validate-adapter")
+    validate = sub.add_parser(
+        "validate-adapter",
+        help="validate schema 2 and the live root README.md entrypoint",
+    )
     validate.add_argument("adapter")
+    validate.add_argument(
+        "--workspace",
+        help="live workspace required to prove the schema-2 root README.md navigation entrypoint",
+    )
     validate.set_defaults(func=validate_adapter_command)
 
     impact = sub.add_parser("impact")
@@ -6689,7 +7036,10 @@ def build_parser() -> argparse.ArgumentParser:
     normalize_archive.add_argument("--input", required=True)
     normalize_archive.set_defaults(func=normalize_archive_result_command)
 
-    diagnose_parser = sub.add_parser("diagnose")
+    diagnose_parser = sub.add_parser(
+        "diagnose",
+        help="run read-only live governance and README navigation checks",
+    )
     diagnose_parser.add_argument("adapter")
     diagnose_parser.add_argument("--workspace", required=True)
     diagnose_parser.set_defaults(func=diagnose_command)

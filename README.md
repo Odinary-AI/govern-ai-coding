@@ -7,6 +7,11 @@ It resolves document authority before edits begin, then binds semantic review,
 frozen final content, project validation, and human decisions before work is
 called complete.
 
+Every governed workspace declares a root `README.md` as the common navigation
+starting point for humans and AI. That navigation role does not implicitly make
+README authoritative for product, architecture, work state, release, or
+history.
+
 ## Install in Codex
 
 ```bash
@@ -37,7 +42,7 @@ Use $govern-ai-coding to close out this change against project facts and evidenc
 
 ## Requirements
 
-- Python 3.10 or later.
+- Python 3.9 or later.
 - Git is optional and is used only for Git-backed change inventory.
 
 The Skill does not decide product meaning, architecture meaning, formal

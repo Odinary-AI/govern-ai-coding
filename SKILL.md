@@ -23,6 +23,12 @@ durable conclusion is written back into mapped project documents.
 Use a project adapter with only pointers, rules, and boundaries. Do not copy
 current project facts into the adapter.
 
+Every governed workspace must declare and contain a root `README.md` navigation
+entrypoint for humans and AI. Navigation alone grants no product, architecture,
+work-state, release, or historical authority. README edits remain ordinary
+governed-document changes unless an authority rule explicitly assigns another
+role.
+
 Read `references/adapter-schema.md` when creating or validating an adapter.
 Use `scripts/govern_ai_coding.py` for deterministic adapter, fixture, and
 live diagnostic checks.
@@ -264,9 +270,11 @@ missing.
 ## Live Diagnostic
 
 Run `diagnose` for a read-only Codex diagnostic of a real workspace. It checks
-adapter structure, mapped authority targets, current and evidence entrypoints,
-configured plan-status conflicts, and local Markdown links in current authority
-documents only.
+adapter structure, the required root README navigation entrypoint and its local
+links, mapped authority targets, current and evidence entrypoints, configured
+plan-status conflicts, and local Markdown links in current authority documents.
+README navigation-link coverage is reported separately from current-authority
+link coverage.
 
 Do not treat diagnostic output as project authority. Write durable conclusions
 back into mapped documents only when the event authorizes documentation edits.
