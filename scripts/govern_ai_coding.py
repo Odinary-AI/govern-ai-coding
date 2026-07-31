@@ -5,14 +5,41 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import re
+import secrets
+import stat
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 from urllib.parse import unquote, urlparse
+
+try:
+    from work_map import (
+        check_work_map,
+        finish_work_item,
+        render_work_map,
+        start_work_item,
+        validate_work_map_config,
+    )
+except ModuleNotFoundError:
+    _work_map_path = Path(__file__).with_name("work_map.py")
+    _work_map_spec = importlib.util.spec_from_file_location(
+        "govern_ai_coding_work_map",
+        _work_map_path,
+    )
+    if _work_map_spec is None or _work_map_spec.loader is None:
+        raise
+    _work_map_module = importlib.util.module_from_spec(_work_map_spec)
+    _work_map_spec.loader.exec_module(_work_map_module)
+    validate_work_map_config = _work_map_module.validate_work_map_config
+    check_work_map = _work_map_module.check_work_map
+    start_work_item = _work_map_module.start_work_item
+    finish_work_item = _work_map_module.finish_work_item
+    render_work_map = _work_map_module.render_work_map
 
 
 CHANGE_KINDS = {"added", "modified", "deleted", "renamed"}
@@ -21,6 +48,8 @@ IMPACT_RECEIPT_SCHEMA = "govern-ai-coding.receipt.v1"
 FREEZE_RECEIPT_SCHEMA = "govern-ai-coding.freeze-receipt.v1"
 EVENT_MANIFEST_SCHEMA = "govern-ai-coding.event-manifest.v1"
 CLOSEOUT_ATTESTATION_SCHEMA = "govern-ai-coding.closeout-attestation.v1"
+ARCHIVE_REQUEST_SCHEMA = "govern-ai-coding.archive-request.v1"
+ARCHIVE_RECEIPT_SCHEMA = "govern-ai-coding.archive-receipt.v1"
 DEFAULT_INVENTORY_EXCLUDES = [
     ".git/",
     "node_modules/",
@@ -129,6 +158,107 @@ def safe_rule_list(adapter: dict) -> list[dict]:
 def safe_section(adapter: dict, key: str) -> dict:
     value = adapter.get(key, {})
     return value if isinstance(value, dict) else {}
+
+
+def validate_controlled_archive_config(adapter: dict) -> list[dict]:
+    config = adapter.get("controlled_archive")
+    if config is None:
+        return []
+    if not isinstance(config, dict):
+        return [{
+            "code": "invalid-controlled-archive-config",
+            "field": "controlled_archive",
+        }]
+
+    findings: list[dict] = []
+    normalized: dict[str, list[str]] = {}
+    for field in ("source_roots", "archive_roots"):
+        value = config.get(field)
+        if not is_string_list(value) or not value:
+            findings.append({
+                "code": "invalid-controlled-archive-config",
+                "field": f"controlled_archive.{field}",
+            })
+            normalized[field] = []
+            continue
+        for root in value:
+            if re.search(r"[$*?{}\[\]~]", root):
+                findings.append({
+                    "code": "controlled-archive-root-unresolved",
+                    "field": f"controlled_archive.{field}",
+                    "path": root,
+                })
+        roots, root_findings = normalize_paths_with_findings(
+            value,
+            f"controlled_archive.{field}",
+        )
+        findings.extend(root_findings)
+        normalized[field] = roots
+
+    approval_type = config.get("approval_type")
+    if not isinstance(approval_type, str) or not approval_type.strip():
+        findings.append({
+            "code": "invalid-controlled-archive-config",
+            "field": "controlled_archive.approval_type",
+        })
+    elif approval_type not in (
+        adapter.get("human_approval", [])
+        if is_string_list(adapter.get("human_approval"))
+        else []
+    ):
+        findings.append({
+            "code": "controlled-archive-approval-type-not-declared",
+            "type": approval_type,
+        })
+
+    boundaries = safe_section(adapter, "boundaries")
+    entrypoints = safe_section(adapter, "entrypoints")
+    excluded = (
+        boundaries.get("excluded", [])
+        if is_string_list(boundaries.get("excluded", []))
+        else []
+    )
+    protected = (
+        boundaries.get("protected", [])
+        if is_string_list(boundaries.get("protected", []))
+        else []
+    )
+    historical = (
+        entrypoints.get("historical", [])
+        if is_string_list(entrypoints.get("historical", []))
+        else []
+    )
+
+    for root in normalized.get("archive_roots", []):
+        if not any(path_matches(root, pattern) for pattern in excluded):
+            findings.append({
+                "code": "controlled-archive-root-not-excluded",
+                "path": root,
+            })
+    for root in normalized.get("source_roots", []):
+        matched = [
+            pattern
+            for pattern in [*excluded, *protected, *historical]
+            if path_matches(root, pattern)
+        ]
+        if matched:
+            findings.append({
+                "code": "controlled-archive-source-root-not-active",
+                "path": root,
+                "matched": matched,
+            })
+    for source_root in normalized.get("source_roots", []):
+        for archive_root in normalized.get("archive_roots", []):
+            if path_matches(source_root, archive_root) or path_matches(
+                archive_root,
+                source_root,
+            ):
+                findings.append({
+                    "code": "controlled-archive-roots-overlap",
+                    "source_root": source_root,
+                    "archive_root": archive_root,
+                })
+    return findings
 
 
 def resolve_rule_approval_type(
@@ -314,6 +444,9 @@ def validate_adapter(adapter: dict) -> dict:
                 if not is_string_list(check.get("plan_paths")):
                     add_type_finding(findings, "invalid-plan-status-plan-paths", f"plan_status_checks.{index}.plan_paths", "list of strings")
 
+    findings.extend(validate_work_map_config(adapter))
+    findings.extend(validate_controlled_archive_config(adapter))
+
     return {
         "result": "fail" if findings else "pass",
         "adapter": {
@@ -421,6 +554,42 @@ def extract_impact_receipt(payload: object) -> tuple[dict | None, list[dict]]:
 def validate_adapter_command(args: argparse.Namespace) -> None:
     adapter, missing = load_json_or_missing(Path(args.adapter))
     emit(missing if missing else validate_adapter(adapter))
+
+
+def work_map_command(args: argparse.Namespace) -> None:
+    adapter, missing = load_json_or_missing(Path(args.adapter))
+    if missing:
+        emit(missing)
+        return
+    validation = validate_adapter(adapter)
+    if validation["result"] != "pass":
+        emit(validation)
+        return
+    if "work_map" not in adapter:
+        emit({
+            "result": "unproven",
+            "mechanical_findings": [],
+            "semantic_findings": [],
+            "human_approval_required": [],
+            "recovery": "Add an optional work_map adapter configuration before using Work Map commands.",
+        })
+        return
+    workspace = Path(args.workspace)
+    if args.work_map_action == "check":
+        payload = check_work_map(adapter, workspace)
+    elif args.work_map_action == "start":
+        payload = start_work_item(adapter, workspace, args.item, args.task_id)
+    elif args.work_map_action == "finish":
+        payload = finish_work_item(
+            adapter,
+            workspace,
+            args.item,
+            args.task_id,
+            args.disposition,
+        )
+    else:
+        payload = render_work_map(adapter, workspace, args.format)
+    emit(payload)
 
 
 def assertion_finding(
@@ -892,6 +1061,29 @@ def validate_event_manifest(manifest: object) -> tuple[dict | None, list[dict]]:
             "field": "closeout.recovery_actions",
         })
 
+    binding = manifest.get("work_map_binding")
+    if binding is not None:
+        required_binding = {
+            "item_id",
+            "task_id",
+            "source_digest",
+            "expected_disposition",
+            "attestation_path",
+        }
+        valid = (
+            isinstance(binding, dict)
+            and required_binding.issubset(binding)
+            and all(isinstance(binding.get(key), str) and binding.get(key).strip() for key in required_binding)
+            and re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", binding.get("task_id", ""))
+            and re.fullmatch(r"[0-9a-f]{64}", binding.get("source_digest", ""))
+            and Path(binding.get("attestation_path", "")).is_absolute()
+        )
+        if not valid:
+            findings.append({
+                "code": "event-manifest-work-map-binding-invalid",
+                "field": "work_map_binding",
+            })
+
     if findings:
         return None, findings
     normalized = json.loads(json.dumps(manifest))
@@ -1076,6 +1268,97 @@ def validate_validation_receipts(
                 "path": raw_path,
             })
     return findings
+
+
+def evaluate_impact_path_reconciliation(
+    impact_receipt: dict,
+    actual_paths: list[str],
+) -> tuple[list[dict], list[dict]]:
+    planned = set(normalize_paths(impact_receipt.get("planned_paths", [])))
+    actual = set(normalize_paths(actual_paths))
+    findings = [
+        {
+            "code": "impact-unplanned-actual-path",
+            "path": path,
+            "recovery_actions": [
+                "Run a new Impact including this path before further governed edits."
+            ],
+        }
+        for path in sorted(actual - planned)
+    ]
+    warnings = [
+        {
+            "code": "impact-planned-path-unused",
+            "path": path,
+            "message": "Impact planned path was not changed in this event.",
+        }
+        for path in sorted(planned - actual)
+    ]
+    return findings, warnings
+
+
+def validate_structured_validation_receipt(
+    receipt_path: Path,
+    workspace: Path,
+    freeze_receipt: dict,
+) -> tuple[dict | None, list[dict]]:
+    try:
+        receipt = load_json(receipt_path)
+    except FileNotFoundError:
+        return None, [{"code": "validation-receipt-missing", "path": str(receipt_path)}]
+    except SystemExit:
+        return None, [{"code": "validation-receipt-malformed", "path": str(receipt_path)}]
+    findings: list[dict] = []
+    if receipt.get("schema") != "govern-ai-coding.validation-receipt.v1":
+        findings.append({"code": "validation-receipt-schema-invalid", "path": str(receipt_path)})
+    if receipt.get("result") != "pass":
+        findings.append({"code": "validation-receipt-result-not-pass", "path": str(receipt_path)})
+    expected_freeze = canonical_json_digest(freeze_receipt)
+    if (receipt.get("freeze") or {}).get("digest") != expected_freeze:
+        findings.append({"code": "validation-receipt-freeze-mismatch", "path": str(receipt_path)})
+    frozen = receipt.get("frozen_paths")
+    if not isinstance(frozen, list):
+        findings.append({"code": "validation-receipt-frozen-paths-invalid", "path": str(receipt_path)})
+        frozen = []
+    expected_paths = {
+        entry.get("path"): entry.get("digest")
+        for entry in freeze_receipt.get("paths", [])
+        if isinstance(entry, dict)
+    }
+    actual_paths = {
+        entry.get("path"): entry.get("digest")
+        for entry in frozen
+        if isinstance(entry, dict)
+    }
+    if actual_paths != expected_paths:
+        findings.append({"code": "validation-receipt-frozen-paths-mismatch", "path": str(receipt_path)})
+    for path, digest in expected_paths.items():
+        target = workspace / path
+        if not target.is_file() or file_digest(target) != digest:
+            findings.append({"code": "validation-receipt-frozen-content-mismatch", "path": path})
+    commands = receipt.get("commands")
+    if not isinstance(commands, list) or not commands or any(
+        not isinstance(command, dict)
+        or not isinstance(command.get("command"), str)
+        or command.get("result") != "pass"
+        for command in commands
+    ):
+        findings.append({"code": "validation-receipt-commands-invalid", "path": str(receipt_path)})
+    for field in ("environment", "supported_claims", "unsupported_claims"):
+        value = receipt.get(field)
+        if field == "environment":
+            valid = isinstance(value, dict) and bool(value)
+        else:
+            valid = is_string_list(value) and bool(value)
+        if not valid:
+            findings.append({"code": "validation-receipt-field-invalid", "field": field})
+    if findings:
+        return None, findings
+    return {
+        "path": str(receipt_path),
+        "digest": canonical_json_digest(receipt),
+        "schema": receipt["schema"],
+    }, []
 
 
 def impact_command(args: argparse.Namespace) -> None:
@@ -1393,29 +1676,122 @@ def atomic_write_json(
     destination: Path,
     *,
     overwrite: bool = True,
-) -> None:
+    parent_descriptor: int | None = None,
+) -> tuple[int, int]:
     destination = Path(destination)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    if not overwrite and destination.exists():
-        raise FileExistsError(f"destination already exists: {destination}")
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{destination.name}.",
-        suffix=".tmp",
-        dir=destination.parent,
-    )
-    temporary = Path(temporary_name)
+    temporary: Path | None = None
+    temporary_name: str
+    if parent_descriptor is None:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if not overwrite and destination.exists():
+            raise FileExistsError(f"destination already exists: {destination}")
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{destination.name}.",
+            suffix=".tmp",
+            dir=destination.parent,
+        )
+        temporary = Path(temporary_name)
+    else:
+        if not overwrite:
+            try:
+                os.stat(
+                    destination.name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                pass
+            else:
+                raise FileExistsError(
+                    f"destination already exists: {destination}"
+                )
+        temporary_name = (
+            f".{destination.name}.{secrets.token_hex(32)}.tmp"
+        )
+        descriptor = os.open(
+            temporary_name,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=parent_descriptor,
+        )
+    published = False
+    payload_identity: tuple[int, int] | None = None
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=2, sort_keys=True)
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
-        if not overwrite and destination.exists():
-            raise FileExistsError(f"destination already exists: {destination}")
-        os.replace(temporary, destination)
+            payload_stat = os.fstat(handle.fileno())
+            payload_identity = (payload_stat.st_dev, payload_stat.st_ino)
+        if parent_descriptor is None:
+            if overwrite:
+                os.replace(temporary, destination)
+                published = True
+            else:
+                os.link(temporary, destination, follow_symlinks=False)
+                published = True
+                temporary.unlink()
+        else:
+            if overwrite:
+                os.rename(
+                    temporary_name,
+                    destination.name,
+                    src_dir_fd=parent_descriptor,
+                    dst_dir_fd=parent_descriptor,
+                )
+                published = True
+            else:
+                os.link(
+                    temporary_name,
+                    destination.name,
+                    src_dir_fd=parent_descriptor,
+                    dst_dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+                published = True
+                os.unlink(temporary_name, dir_fd=parent_descriptor)
     except BaseException:
-        temporary.unlink(missing_ok=True)
+        if not published and not overwrite:
+            try:
+                if parent_descriptor is None:
+                    published = os.path.samefile(temporary, destination)
+                else:
+                    temporary_stat = os.stat(
+                        temporary_name,
+                        dir_fd=parent_descriptor,
+                        follow_symlinks=False,
+                    )
+                    destination_stat = os.stat(
+                        destination.name,
+                        dir_fd=parent_descriptor,
+                        follow_symlinks=False,
+                    )
+                    published = (
+                        temporary_stat.st_dev,
+                        temporary_stat.st_ino,
+                    ) == (
+                        destination_stat.st_dev,
+                        destination_stat.st_ino,
+                    )
+            except (FileNotFoundError, OSError):
+                pass
+        try:
+            if parent_descriptor is None:
+                temporary.unlink(missing_ok=True)
+            else:
+                os.unlink(temporary_name, dir_fd=parent_descriptor)
+        except FileNotFoundError:
+            pass
+        if published and payload_identity is not None:
+            return payload_identity
         raise
+    if payload_identity is None:
+        raise OSError("atomic JSON payload identity was not captured")
+    return payload_identity
 
 
 def write_receipt_file(
@@ -1438,6 +1814,1147 @@ def write_receipt_file(
             "message": str(exc),
         }]
     return str(destination), []
+
+
+def archive_path(
+    workspace: Path,
+    relative: str,
+    field: str,
+) -> tuple[Path | None, dict | None]:
+    if re.search(r"[$*?{}\[\]~]", relative):
+        return None, {
+            "code": "archive-path-unresolved",
+            "field": field,
+            "path": relative,
+        }
+    normalized, finding = normalize_path_value(relative, field)
+    if finding or normalized is None:
+        return None, finding
+    workspace = workspace.resolve()
+    candidate = workspace / normalized
+    current = workspace
+    for part in Path(normalized).parts:
+        current = current / part
+        if current.is_symlink():
+            return None, {
+                "code": "archive-path-traverses-symlink",
+                "field": field,
+                "path": normalized,
+            }
+    resolved = candidate.resolve()
+    try:
+        resolved.relative_to(workspace)
+    except ValueError:
+        return None, {
+            "code": "archive-path-outside-workspace",
+            "field": field,
+            "path": normalized,
+        }
+    return candidate, None
+
+
+def active_reference_docs(
+    adapter: dict,
+    workspace: Path,
+) -> tuple[list[Path], list[dict]]:
+    workspace = workspace.resolve()
+    excluded = safe_section(adapter, "boundaries").get("excluded", [])
+    historical = safe_section(adapter, "entrypoints").get("historical", [])
+    archive_roots = safe_section(adapter, "controlled_archive").get(
+        "archive_roots",
+        [],
+    )
+    inactive_patterns = [*excluded, *historical, *archive_roots]
+    pointers: list[str] = []
+    current = safe_section(adapter, "entrypoints").get("current", [])
+    if is_string_list(current):
+        pointers.extend(current)
+    for rule in safe_rule_list(adapter):
+        if is_string_list(rule.get("paths")):
+            pointers.extend(rule["paths"])
+
+    documents: list[Path] = []
+    findings: list[dict] = []
+    seen: set[Path] = set()
+    for pointer in sorted(set(pointers)):
+        normalized_pointer, pointer_finding = normalize_path_value(
+            pointer,
+            "active_reference_root",
+        )
+        if pointer_finding or normalized_pointer is None:
+            findings.append(pointer_finding or {
+                "code": "invalid-active-reference-root",
+                "path": pointer,
+            })
+            continue
+        if any(
+            path_matches(normalized_pointer, pattern)
+            for pattern in inactive_patterns
+        ):
+            continue
+        path, finding = archive_path(workspace, pointer, "active_reference_root")
+        if finding or path is None:
+            findings.append(finding or {
+                "code": "invalid-active-reference-root",
+                "path": pointer,
+            })
+            continue
+        pointer_is_file = path.is_file()
+        if not path.exists():
+            findings.append({
+                "code": "active-reference-pointer-missing",
+                "path": normalized_pointer,
+            })
+            continue
+        candidates = [path] if pointer_is_file else (
+            sorted(candidate for candidate in path.rglob("*") if candidate.is_file())
+            if path.is_dir()
+            else []
+        )
+        for candidate in candidates:
+            try:
+                relative = candidate.relative_to(workspace).as_posix()
+            except ValueError:
+                continue
+            if any(path_matches(relative, pattern) for pattern in inactive_patterns):
+                continue
+            safe_candidate, candidate_finding = archive_path(
+                workspace,
+                relative,
+                "active_reference_path",
+            )
+            if candidate_finding or safe_candidate is None:
+                findings.append(candidate_finding or {
+                    "code": "invalid-active-reference-path",
+                    "path": relative,
+                })
+                continue
+            if not safe_candidate.is_file():
+                continue
+            resolved = safe_candidate.resolve()
+            if resolved not in seen:
+                seen.add(resolved)
+                documents.append(safe_candidate)
+    return documents, findings
+
+
+def discover_active_references(
+    adapter: dict,
+    workspace: Path,
+    source: str,
+    source_path: Path,
+) -> tuple[list[dict], list[dict], list[str]]:
+    documents, findings = active_reference_docs(adapter, workspace)
+    references: list[dict] = []
+    for document in documents:
+        if document.resolve() == source_path.resolve():
+            continue
+        relative_doc = document.relative_to(workspace.resolve()).as_posix()
+        try:
+            lines = document.read_text(encoding="utf-8").splitlines()
+        except UnicodeDecodeError:
+            findings.append({
+                "code": "active-reference-document-not-utf8",
+                "path": relative_doc,
+            })
+            continue
+        except OSError as exc:
+            findings.append({
+                "code": "active-reference-document-unreadable",
+                "path": relative_doc,
+                "message": str(exc),
+            })
+            continue
+        for line_number, line in enumerate(lines, start=1):
+            matched = source in line
+            if not matched:
+                for link in markdown_links(line):
+                    if not is_local_link(link):
+                        continue
+                    if resolve_link(document, link) == source_path.resolve():
+                        matched = True
+                        break
+            if matched:
+                references.append({
+                    "path": relative_doc,
+                    "line": line_number,
+                })
+    unique = {
+        (reference["path"], reference["line"]): reference
+        for reference in references
+    }
+    scanned = sorted(
+        document.relative_to(workspace.resolve()).as_posix()
+        for document in documents
+        if document.resolve() != source_path.resolve()
+    )
+    return [unique[key] for key in sorted(unique)], findings, scanned
+
+
+def validate_archive_references(
+    request: dict,
+    discovered: list[dict],
+    scanned_paths: list[str],
+) -> tuple[dict, list[dict], list[str]]:
+    declaration = request.get("references")
+    if not isinstance(declaration, dict):
+        return {}, [{
+            "code": "invalid-archive-request",
+            "field": "references",
+        }], []
+    status = declaration.get("status")
+    legacy = declaration.get("legacy")
+    if status not in {"updated", "legacy-dispositions"} or not isinstance(legacy, list):
+        return {}, [{
+            "code": "invalid-archive-request",
+            "field": "references",
+        }], []
+
+    dispositions: list[dict] = []
+    findings: list[dict] = []
+    for index, item in enumerate(legacy):
+        if not isinstance(item, dict):
+            findings.append({
+                "code": "invalid-archive-request",
+                "field": f"references.legacy.{index}",
+            })
+            continue
+        path = item.get("path")
+        line = item.get("line")
+        resolution = item.get("resolution")
+        normalized, path_finding = normalize_path_value(
+            path if isinstance(path, str) else "",
+            f"references.legacy.{index}.path",
+        )
+        if (
+            path_finding
+            or normalized is None
+            or not isinstance(line, int)
+            or line < 1
+            or not isinstance(resolution, str)
+            or not resolution.strip()
+        ):
+            findings.append({
+                "code": "invalid-archive-request",
+                "field": f"references.legacy.{index}",
+            })
+            continue
+        dispositions.append({
+            "path": normalized,
+            "line": line,
+            "resolution": resolution.strip(),
+        })
+
+    declared = {
+        (item["path"], item["line"])
+        for item in dispositions
+    }
+    required = {
+        (item["path"], item["line"])
+        for item in discovered
+    }
+    unverified: list[str] = []
+    if discovered and (
+        status == "updated"
+        or not required.issubset(declared)
+    ):
+        unverified.append("archive-references-unresolved")
+    return {
+        "status": status,
+        "scanned_paths": scanned_paths,
+        "discovered": discovered,
+        "dispositions": dispositions,
+    }, findings, unverified
+
+
+def archive_failure(
+    *,
+    result: str,
+    mechanical: list[dict],
+    unverified: list[str],
+    human_required: list[str],
+    mapping: dict | None = None,
+    recovery: str,
+) -> dict:
+    return {
+        "result": result,
+        "mechanical_findings": mechanical,
+        "semantic_findings": [],
+        "human_approval_required": human_required,
+        "coverage": {"unverified": sorted(set(unverified))},
+        "controlled_archive": {
+            "mapping": mapping,
+            "moved": False,
+        },
+        "archive_receipt": None,
+        "receipt_output": None,
+        "recovery": recovery,
+    }
+
+
+def canonical_json_digest(payload: dict) -> str:
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def open_directory_no_symlinks(root: Path, parts: tuple[str, ...]) -> int:
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    directory_only = getattr(os, "O_DIRECTORY", 0)
+    descriptor = os.open(root, os.O_RDONLY | directory_only | no_follow)
+    try:
+        for part in parts:
+            next_descriptor = os.open(
+                part,
+                os.O_RDONLY | directory_only | no_follow,
+                dir_fd=descriptor,
+            )
+            os.close(descriptor)
+            descriptor = next_descriptor
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def descriptor_digest(descriptor: int) -> str:
+    digest = hashlib.sha256()
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    while True:
+        chunk = os.read(descriptor, 1024 * 1024)
+        if not chunk:
+            break
+        digest.update(chunk)
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    return digest.hexdigest()
+
+
+def descriptor_matches_path(
+    descriptor: int,
+    path: Path,
+) -> bool:
+    try:
+        path_stat = path.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    descriptor_stat = os.fstat(descriptor)
+    return (
+        path_stat.st_dev,
+        path_stat.st_ino,
+    ) == (
+        descriptor_stat.st_dev,
+        descriptor_stat.st_ino,
+    )
+
+
+def descriptor_matches_name(
+    descriptor: int,
+    parent_descriptor: int,
+    name: str,
+) -> bool:
+    try:
+        path_stat = os.stat(
+            name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return False
+    descriptor_stat = os.fstat(descriptor)
+    return (
+        path_stat.st_dev,
+        path_stat.st_ino,
+    ) == (
+        descriptor_stat.st_dev,
+        descriptor_stat.st_ino,
+    )
+
+
+def unlink_descriptor_name(
+    descriptor: int,
+    parent_descriptor: int,
+    name: str,
+) -> None:
+    if not descriptor_matches_name(descriptor, parent_descriptor, name):
+        raise OSError(f"refusing to unlink replaced transaction path: {name}")
+    os.unlink(name, dir_fd=parent_descriptor)
+
+
+def copy_descriptor_exclusive(
+    source_descriptor: int,
+    destination_parent_descriptor: int,
+    destination_name: str,
+) -> int:
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    destination_descriptor = None
+    destination_created = False
+    try:
+        source_mode = os.fstat(source_descriptor).st_mode & 0o777
+        destination_descriptor = os.open(
+            destination_name,
+            os.O_RDWR | os.O_CREAT | os.O_EXCL | no_follow,
+            source_mode,
+            dir_fd=destination_parent_descriptor,
+        )
+        destination_created = True
+        os.lseek(source_descriptor, 0, os.SEEK_SET)
+        while True:
+            chunk = os.read(source_descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            offset = 0
+            while offset < len(chunk):
+                written = os.write(destination_descriptor, chunk[offset:])
+                if written <= 0:
+                    raise OSError("archive copy made no forward progress")
+                offset += written
+        os.fsync(destination_descriptor)
+        os.lseek(source_descriptor, 0, os.SEEK_SET)
+        return destination_descriptor
+    except BaseException:
+        if (
+            destination_created
+            and destination_descriptor is not None
+            and descriptor_matches_name(
+                destination_descriptor,
+                destination_parent_descriptor,
+                destination_name,
+            )
+        ):
+            os.unlink(
+                destination_name,
+                dir_fd=destination_parent_descriptor,
+            )
+        if destination_descriptor is not None:
+            os.close(destination_descriptor)
+        raise
+
+
+def execute_controlled_archive(
+    adapter: dict,
+    workspace: Path,
+    request: dict,
+    receipt_destination: Path,
+) -> dict:
+    workspace = workspace.resolve()
+    config = safe_section(adapter, "controlled_archive")
+    mechanical = validate_controlled_archive_config(adapter)
+    unverified: list[str] = []
+    human_required: list[str] = []
+
+    if request.get("schema") != ARCHIVE_REQUEST_SCHEMA:
+        mechanical.append({
+            "code": "unsupported-archive-request-schema",
+            "schema": request.get("schema"),
+        })
+    if request.get("schema_version") != "1":
+        mechanical.append({
+            "code": "unsupported-archive-request-version",
+            "schema_version": request.get("schema_version"),
+        })
+
+    mapping = request.get("mapping")
+    source = mapping.get("source") if isinstance(mapping, dict) else None
+    target = mapping.get("target") if isinstance(mapping, dict) else None
+    if not isinstance(source, str) or not isinstance(target, str):
+        mechanical.append({
+            "code": "invalid-archive-request",
+            "field": "mapping",
+        })
+        source = source if isinstance(source, str) else ""
+        target = target if isinstance(target, str) else ""
+    normalized_source, source_finding = normalize_path_value(
+        source,
+        "mapping.source",
+    )
+    normalized_target, target_finding = normalize_path_value(
+        target,
+        "mapping.target",
+    )
+    if source_finding:
+        mechanical.append(source_finding)
+    if target_finding:
+        mechanical.append(target_finding)
+    source = normalized_source or source
+    target = normalized_target or target
+    normalized_mapping = {"source": source, "target": target}
+
+    reason = request.get("reason")
+    if not isinstance(reason, str) or not reason.strip():
+        mechanical.append({
+            "code": "invalid-archive-request",
+            "field": "reason",
+        })
+
+    disposition = request.get("authority_disposition")
+    disposition_kind = disposition.get("kind") if isinstance(disposition, dict) else None
+    disposition_statement = (
+        disposition.get("statement")
+        if isinstance(disposition, dict)
+        else None
+    )
+    replacement = (
+        disposition.get("replacement")
+        if isinstance(disposition, dict)
+        else None
+    )
+    if (
+        disposition_kind
+        not in {"replacement", "authority-transfer", "no-replacement"}
+        or not isinstance(disposition_statement, str)
+        or not disposition_statement.strip()
+    ):
+        mechanical.append({
+            "code": "invalid-archive-request",
+            "field": "authority_disposition",
+        })
+    if disposition_kind in {"replacement", "authority-transfer"}:
+        if not isinstance(replacement, str) or not replacement.strip():
+            mechanical.append({
+                "code": "invalid-archive-request",
+                "field": "authority_disposition.replacement",
+            })
+    elif disposition_kind == "no-replacement" and replacement is not None:
+        mechanical.append({
+            "code": "invalid-archive-request",
+            "field": "authority_disposition.replacement",
+        })
+
+    source_roots = config.get("source_roots", [])
+    archive_roots = config.get("archive_roots", [])
+    if source and not any(path_matches(source, root) for root in source_roots):
+        mechanical.append({
+            "code": "archive-source-outside-configured-root",
+            "path": source,
+        })
+    if target and not any(path_matches(target, root) for root in archive_roots):
+        mechanical.append({
+            "code": "archive-target-outside-configured-root",
+            "path": target,
+        })
+    if source == target and source:
+        mechanical.append({
+            "code": "archive-source-equals-target",
+            "path": source,
+        })
+
+    source_path, archive_source_finding = archive_path(
+        workspace,
+        source,
+        "mapping.source",
+    )
+    target_path, archive_target_finding = archive_path(
+        workspace,
+        target,
+        "mapping.target",
+    )
+    if archive_source_finding:
+        mechanical.append(archive_source_finding)
+    if archive_target_finding:
+        mechanical.append(archive_target_finding)
+
+    boundaries = safe_section(adapter, "boundaries")
+    entrypoints = safe_section(adapter, "entrypoints")
+    for pattern in boundaries.get("excluded", []):
+        if source and path_matches(source, pattern):
+            mechanical.append({
+                "code": "archive-source-not-active",
+                "path": source,
+                "matched": pattern,
+            })
+    for pattern in boundaries.get("protected", []):
+        if source and path_matches(source, pattern):
+            mechanical.append({
+                "code": "archive-source-not-active",
+                "path": source,
+                "matched": pattern,
+            })
+    for pattern in entrypoints.get("historical", []):
+        if source and path_matches(source, pattern):
+            mechanical.append({
+                "code": "archive-source-not-active",
+                "path": source,
+                "matched": pattern,
+            })
+
+    if source_path is not None and (
+        not source_path.is_file()
+        or source_path.is_symlink()
+    ):
+        mechanical.append({
+            "code": "archive-source-not-regular-file",
+            "path": source,
+        })
+    if target_path is not None:
+        if target_path.exists() or target_path.is_symlink():
+            mechanical.append({
+                "code": "archive-target-exists",
+                "path": target,
+            })
+        if not target_path.parent.is_dir():
+            mechanical.append({
+                "code": "archive-target-parent-missing",
+                "path": target_path.parent.relative_to(workspace).as_posix(),
+            })
+
+    normalized_replacement = None
+    if isinstance(replacement, str) and replacement.strip():
+        normalized_replacement, replacement_finding = normalize_path_value(
+            replacement,
+            "authority_disposition.replacement",
+        )
+        if replacement_finding:
+            mechanical.append(replacement_finding)
+        if normalized_replacement:
+            if normalized_replacement in {source, target}:
+                mechanical.append({
+                    "code": "archive-replacement-conflicts-with-mapping",
+                    "path": normalized_replacement,
+                })
+            replacement_path, replacement_path_finding = archive_path(
+                workspace,
+                normalized_replacement,
+                "authority_disposition.replacement",
+            )
+            if replacement_path_finding:
+                mechanical.append(replacement_path_finding)
+            elif (
+                replacement_path is None
+                or not replacement_path.is_file()
+                or replacement_path.is_symlink()
+            ):
+                mechanical.append({
+                    "code": "archive-replacement-not-active-file",
+                    "path": normalized_replacement,
+                })
+            if any(
+                path_matches(normalized_replacement, pattern)
+                for pattern in [
+                    *boundaries.get("excluded", []),
+                    *boundaries.get("protected", []),
+                    *entrypoints.get("historical", []),
+                ]
+            ):
+                mechanical.append({
+                    "code": "archive-replacement-not-active-file",
+                    "path": normalized_replacement,
+                })
+
+    approval_type = config.get("approval_type")
+    approval = request.get("approval")
+    approval_evidence = (
+        approval.get("evidence")
+        if isinstance(approval, dict)
+        else None
+    )
+    approval_digest = None
+    normalized_evidence = None
+    if (
+        not isinstance(approval, dict)
+        or approval.get("type") != approval_type
+        or not isinstance(approval_evidence, str)
+        or not approval_evidence.strip()
+    ):
+        unverified.append("archive-approval-missing")
+        if isinstance(approval_type, str):
+            human_required.append(approval_type)
+    else:
+        normalized_evidence, evidence_finding = normalize_path_value(
+            approval_evidence,
+            "approval.evidence",
+        )
+        if evidence_finding:
+            mechanical.append(evidence_finding)
+        if normalized_evidence:
+            evidence_path, evidence_path_finding = archive_path(
+                workspace,
+                normalized_evidence,
+                "approval.evidence",
+            )
+            if evidence_path_finding:
+                mechanical.append(evidence_path_finding)
+            evidence_ordinary = any(
+                path_matches(normalized_evidence, pattern)
+                for pattern in boundaries.get("ordinary_docs", [])
+            )
+            evidence_forbidden = any(
+                path_matches(normalized_evidence, pattern)
+                for pattern in [
+                    *boundaries.get("excluded", []),
+                    *boundaries.get("protected", []),
+                    *entrypoints.get("historical", []),
+                ]
+            )
+            if (
+                evidence_path is None
+                or not evidence_path.is_file()
+                or evidence_path.is_symlink()
+                or not evidence_ordinary
+                or evidence_forbidden
+            ):
+                unverified.append("archive-approval-evidence-invalid")
+                human_required.append(approval_type)
+            else:
+                try:
+                    evidence_text = evidence_path.read_text(encoding="utf-8")
+                except UnicodeDecodeError:
+                    mechanical.append({
+                        "code": "archive-approval-evidence-not-utf8",
+                        "path": normalized_evidence,
+                    })
+                else:
+                    if (
+                        generated_non_authority_evidence(evidence_text)
+                        or not text_records_archive_approval(
+                            evidence_text,
+                            approval_type,
+                            source,
+                            target,
+                        )
+                    ):
+                        unverified.append("archive-approval-scope-mismatch")
+                        human_required.append(approval_type)
+                    else:
+                        approval_digest = file_digest(evidence_path)
+                if approval_digest is None and not any(
+                    finding.get("code") == "archive-approval-evidence-not-utf8"
+                    and finding.get("path") == normalized_evidence
+                    for finding in mechanical
+                ):
+                    human_required.append(approval_type)
+
+    discovered: list[dict] = []
+    scanned_paths: list[str] = []
+    reference_summary: dict = {}
+    if source_path is not None and source_path.is_file() and not source_path.is_symlink():
+        discovered, reference_findings, scanned_paths = discover_active_references(
+            adapter,
+            workspace,
+            source,
+            source_path,
+        )
+        mechanical.extend(reference_findings)
+    reference_summary, declaration_findings, reference_unverified = (
+        validate_archive_references(request, discovered, scanned_paths)
+    )
+    mechanical.extend(declaration_findings)
+    unverified.extend(reference_unverified)
+
+    destination, receipt_findings = resolve_receipt_output_path(
+        str(receipt_destination),
+        workspace,
+        adapter,
+    )
+    mechanical.extend(receipt_findings)
+    if destination is not None:
+        if destination.exists() or destination.is_symlink():
+            mechanical.append({
+                "code": "archive-receipt-exists",
+                "path": str(destination),
+            })
+        if not destination.parent.is_dir():
+            mechanical.append({
+                "code": "archive-receipt-parent-missing",
+                "path": str(destination.parent),
+            })
+
+    if mechanical:
+        return archive_failure(
+            result="fail",
+            mechanical=mechanical,
+            unverified=unverified,
+            human_required=human_required,
+            mapping=normalized_mapping,
+            recovery="Fix the controlled archive request and adapter findings; no file was moved.",
+        )
+    if unverified:
+        return archive_failure(
+            result="unproven",
+            mechanical=[],
+            unverified=unverified,
+            human_required=human_required,
+            mapping=normalized_mapping,
+            recovery="Provide the missing approval or reference dispositions; no file was moved.",
+        )
+    if source_path is None or target_path is None or destination is None:
+        return archive_failure(
+            result="fail",
+            mechanical=[{"code": "archive-preflight-incomplete"}],
+            unverified=[],
+            human_required=[],
+            mapping=normalized_mapping,
+            recovery="Rerun preflight with fully resolved paths; no file was moved.",
+        )
+
+    before_digest = file_digest(source_path)
+    normalized_disposition = {
+        "kind": disposition_kind,
+        "replacement": normalized_replacement,
+        "statement": disposition_statement.strip(),
+    }
+    receipt = {
+        "schema": ARCHIVE_RECEIPT_SCHEMA,
+        "schema_version": "1",
+        "kind": "controlled-archive",
+        "immutable": True,
+        "derived_evidence": True,
+        "generated": True,
+        "project_authority": False,
+        "adapter": {
+            "project": adapter.get("project"),
+            "schema_version": adapter.get("schema_version"),
+        },
+        "workspace": {"path": str(workspace)},
+        "request_sha256": canonical_json_digest(request),
+        "mapping": normalized_mapping,
+        "archive_reason": reason.strip(),
+        "authority_disposition": normalized_disposition,
+        "approval": {
+            "type": approval_type,
+            "evidence": normalized_evidence,
+            "evidence_sha256": approval_digest,
+        },
+        "content": {
+            "before_sha256": before_digest,
+            "after_sha256": None,
+            "unchanged": False,
+        },
+        "references": reference_summary,
+        "execution": {
+            "result": "pass",
+            "operation": "single-file active-to-immutable-archive move",
+        },
+        "recovery": {
+            "instructions": (
+                f"To recover, obtain separate explicit approval and copy the "
+                f"verified bytes from {target} to an unoccupied active path. "
+                "Do not modify or remove the archived target; preserve this receipt."
+            ),
+        },
+    }
+
+    source_parent_descriptor = None
+    target_parent_descriptor = None
+    receipt_parent_descriptor = None
+    staging_descriptor = None
+    target_descriptor = None
+    receipt_descriptor = None
+    staging_name = None
+    staging_present = False
+    target_present = False
+    receipt_present = False
+    try:
+        source_parts = Path(source).parts
+        target_parts = Path(target).parts
+        source_parent_descriptor = open_directory_no_symlinks(
+            workspace,
+            source_parts[:-1],
+        )
+        target_parent_descriptor = open_directory_no_symlinks(
+            workspace,
+            target_parts[:-1],
+        )
+        receipt_root = Path(destination.anchor)
+        receipt_parent_descriptor = open_directory_no_symlinks(
+            receipt_root,
+            destination.parent.relative_to(receipt_root).parts,
+        )
+        if not descriptor_matches_path(
+            source_parent_descriptor,
+            source_path.parent,
+        ) or not descriptor_matches_path(
+            target_parent_descriptor,
+            target_path.parent,
+        ) or not descriptor_matches_path(
+            receipt_parent_descriptor,
+            destination.parent,
+        ):
+            raise OSError("archive parent changed after preflight")
+        if file_digest(source_path) != before_digest:
+            raise OSError("archive source changed after preflight")
+
+        staging_name = (
+            f".{source_parts[-1]}.controlled-archive-"
+            f"{secrets.token_hex(32)}.tmp"
+        )
+        os.rename(
+            source_parts[-1],
+            staging_name,
+            src_dir_fd=source_parent_descriptor,
+            dst_dir_fd=source_parent_descriptor,
+        )
+        staging_present = True
+        staging_descriptor = os.open(
+            staging_name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=source_parent_descriptor,
+        )
+        if not stat.S_ISREG(os.fstat(staging_descriptor).st_mode):
+            raise OSError("archive source is no longer a regular file")
+        if descriptor_digest(staging_descriptor) != before_digest:
+            raise OSError("archive source changed during retirement")
+
+        target_descriptor = copy_descriptor_exclusive(
+            staging_descriptor,
+            target_parent_descriptor,
+            target_parts[-1],
+        )
+        target_present = True
+        after_digest = descriptor_digest(target_descriptor)
+        if after_digest != before_digest:
+            raise OSError("archive content digest changed during copy")
+        if not descriptor_matches_path(
+            source_parent_descriptor,
+            source_path.parent,
+        ) or not descriptor_matches_path(
+            target_parent_descriptor,
+            target_path.parent,
+        ) or not descriptor_matches_path(
+            receipt_parent_descriptor,
+            destination.parent,
+        ):
+            raise OSError("archive parent changed during execution")
+
+        receipt["content"]["after_sha256"] = after_digest
+        receipt["content"]["unchanged"] = True
+        receipt_identity = atomic_write_json(
+            receipt,
+            destination,
+            overwrite=False,
+            parent_descriptor=receipt_parent_descriptor,
+        )
+        receipt_descriptor = os.open(
+            destination.name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=receipt_parent_descriptor,
+        )
+        receipt_stat = os.fstat(receipt_descriptor)
+        if (
+            receipt_stat.st_dev,
+            receipt_stat.st_ino,
+        ) != receipt_identity:
+            raise OSError("archive receipt changed during publication")
+        receipt_present = True
+        if not descriptor_matches_name(
+            target_descriptor,
+            target_parent_descriptor,
+            target_parts[-1],
+        ):
+            raise OSError("archive target changed during commit")
+        if descriptor_digest(target_descriptor) != before_digest:
+            raise OSError("archive target content changed during commit")
+        if not descriptor_matches_path(
+            source_parent_descriptor,
+            source_path.parent,
+        ) or not descriptor_matches_path(
+            target_parent_descriptor,
+            target_path.parent,
+        ) or not descriptor_matches_path(
+            receipt_parent_descriptor,
+            destination.parent,
+        ):
+            raise OSError("archive parent changed during commit")
+        try:
+            os.stat(
+                source_parts[-1],
+                dir_fd=source_parent_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            raise OSError("archive source path was recreated during commit")
+        unlink_descriptor_name(
+            staging_descriptor,
+            source_parent_descriptor,
+            staging_name,
+        )
+        staging_present = False
+    except BaseException as exc:
+        rollback_errors: list[str] = []
+        if (
+            receipt_present
+            and receipt_descriptor is not None
+            and receipt_parent_descriptor is not None
+        ):
+            try:
+                unlink_descriptor_name(
+                    receipt_descriptor,
+                    receipt_parent_descriptor,
+                    destination.name,
+                )
+                receipt_present = False
+            except OSError as rollback_exc:
+                rollback_errors.append(str(rollback_exc))
+        source_restored = False
+        restore_descriptor = None
+        restore_source_descriptor = (
+            staging_descriptor
+            if staging_present and staging_descriptor is not None
+            else target_descriptor
+        )
+        if (
+            restore_source_descriptor is not None
+            and source_parent_descriptor is not None
+        ):
+            try:
+                restore_descriptor = copy_descriptor_exclusive(
+                    restore_source_descriptor,
+                    source_parent_descriptor,
+                    Path(source).name,
+                )
+                source_restored = True
+            except OSError as rollback_exc:
+                rollback_errors.append(str(rollback_exc))
+            finally:
+                if restore_descriptor is not None:
+                    os.close(restore_descriptor)
+        if (
+            staging_present
+            and staging_descriptor is not None
+            and source_parent_descriptor is not None
+            and source_restored
+        ):
+            try:
+                unlink_descriptor_name(
+                    staging_descriptor,
+                    source_parent_descriptor,
+                    staging_name,
+                )
+                staging_present = False
+            except OSError as rollback_exc:
+                rollback_errors.append(str(rollback_exc))
+        original_preserved = source_restored or staging_present
+        if (
+            target_present
+            and target_descriptor is not None
+            and target_parent_descriptor is not None
+            and original_preserved
+        ):
+            try:
+                unlink_descriptor_name(
+                    target_descriptor,
+                    target_parent_descriptor,
+                    Path(target).name,
+                )
+                target_present = False
+            except OSError as rollback_exc:
+                rollback_errors.append(str(rollback_exc))
+        failure = {
+            "code": "controlled-archive-execution-failed",
+            "message": str(exc),
+        }
+        mechanical = [failure]
+        for rollback_error in rollback_errors:
+            mechanical.append({
+                "code": "controlled-archive-rollback-failed",
+                "message": rollback_error,
+            })
+        if not isinstance(exc, OSError):
+            raise
+        return archive_failure(
+            result="fail",
+            mechanical=mechanical,
+            unverified=[],
+            human_required=[],
+            mapping=normalized_mapping,
+            recovery=(
+                "The move failed and rollback was attempted. Inspect the listed "
+                "source and target before retrying."
+            ),
+        )
+    finally:
+        for descriptor in (
+            receipt_descriptor,
+            target_descriptor,
+            staging_descriptor,
+            receipt_parent_descriptor,
+            target_parent_descriptor,
+            source_parent_descriptor,
+        ):
+            if descriptor is not None:
+                os.close(descriptor)
+
+    return {
+        "result": "pass",
+        "mechanical_findings": [],
+        "semantic_findings": [],
+        "human_approval_required": [],
+        "coverage": {"unverified": []},
+        "controlled_archive": {
+            "mapping": normalized_mapping,
+            "moved": True,
+        },
+        "archive_receipt": receipt,
+        "receipt_output": str(destination),
+        "recovery": receipt["recovery"]["instructions"],
+    }
+
+
+def controlled_archive_command(args: argparse.Namespace) -> None:
+    adapter, missing = load_json_or_missing(Path(args.adapter))
+    if missing:
+        emit(missing)
+        return
+    adapter_result = validate_adapter(adapter)
+    if adapter_result["result"] != "pass":
+        emit({
+            "result": "fail",
+            "mechanical_findings": adapter_result["mechanical_findings"],
+            "semantic_findings": [],
+            "human_approval_required": [],
+            "coverage": {"unverified": []},
+            "controlled_archive": {"mapping": None, "moved": False},
+            "archive_receipt": None,
+            "receipt_output": None,
+            "recovery": "Fix adapter findings before requesting controlled archive intake.",
+        })
+        return
+    try:
+        request = json.loads(Path(args.request).read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        emit({
+            "result": "fail",
+            "mechanical_findings": [{
+                "code": "invalid-archive-request-file",
+                "path": str(args.request),
+                "message": str(exc),
+            }],
+            "semantic_findings": [],
+            "human_approval_required": [],
+            "coverage": {"unverified": []},
+            "controlled_archive": {"mapping": None, "moved": False},
+            "archive_receipt": None,
+            "receipt_output": None,
+            "recovery": "Provide one valid controlled archive request JSON file.",
+        })
+        return
+    if not isinstance(request, dict):
+        emit({
+            "result": "fail",
+            "mechanical_findings": [{
+                "code": "invalid-archive-request",
+                "field": "root",
+            }],
+            "semantic_findings": [],
+            "human_approval_required": [],
+            "coverage": {"unverified": []},
+            "controlled_archive": {"mapping": None, "moved": False},
+            "archive_receipt": None,
+            "receipt_output": None,
+            "recovery": "Provide one controlled archive request object.",
+        })
+        return
+    emit(execute_controlled_archive(
+        adapter,
+        Path(args.workspace),
+        request,
+        Path(args.write_receipt),
+    ))
 
 
 def freeze_command(args: argparse.Namespace) -> None:
@@ -2351,6 +3868,36 @@ def text_records_human_approval(text: str, approval_type: str, targets: list[str
     return True
 
 
+def text_records_archive_approval(
+    text: str,
+    approval_type: str,
+    source: str,
+    target: str,
+) -> bool:
+    fields: dict[str, str] = {}
+    for line in text.splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        fields[key.strip().lower()] = value.strip()
+    required = {"approval type", "object", "scope", "does not approve"}
+    if not required.issubset(fields) or any(not fields[key] for key in required):
+        return False
+    if (
+        fields["approval type"].rstrip(". ").casefold()
+        != approval_type.rstrip(". ").casefold()
+    ):
+        return False
+    object_scope = fields["object"]
+    for path in (source, target):
+        if not re.search(
+            rf"(?<![A-Za-z0-9_./-]){re.escape(path)}(?![A-Za-z0-9_./-])",
+            object_scope,
+        ):
+            return False
+    return True
+
+
 def generated_non_authority_evidence(text: str) -> bool:
     try:
         payload = json.loads(text)
@@ -2670,6 +4217,7 @@ def live_closeout(
 ) -> dict:
     adapter_result = validate_adapter(adapter)
     mechanical = list(adapter_result["mechanical_findings"])
+    path_warnings: list[dict] = []
     human_required = []
     boundary_rules = safe_section(adapter, "boundaries")
     entrypoint_rules = safe_section(adapter, "entrypoints")
@@ -2702,6 +4250,21 @@ def live_closeout(
     mechanical.extend(human_approval_findings)
     normalized_changed = set(verification["actual_paths"] if verification["verified"] else verification["declared_paths"])
     event_paths = sorted(normalized_changed)
+    event_manifest = (
+        getattr(args, "loaded_event_manifest", None)
+        if args is not None
+        else None
+    )
+    if (
+        receipt is not None
+        and isinstance(event_manifest, dict)
+        and event_manifest.get("work_map_binding") is not None
+    ):
+        reconciliation_findings, reconciliation_warnings = (
+            evaluate_impact_path_reconciliation(receipt, event_paths)
+        )
+        mechanical.extend(reconciliation_findings)
+        path_warnings.extend(reconciliation_warnings)
     declared_human_types = adapter.get("human_approval", []) if is_string_list(adapter.get("human_approval")) else []
     valid_approvals = []
     valid_approval_paths = set()
@@ -3035,6 +4598,7 @@ def live_closeout(
         "closeout_receipt": closeout_receipt,
         "semantic_findings": bound_semantic_findings,
         "human_approval_required": sorted(set(human_required)),
+        "warnings": list(adapter_result.get("warnings", [])) + path_warnings,
         "recovery": "Live Closeout checked adapter, receipt/baseline, change source, actual event paths, affected governed questions, unresolved semantic findings, unresolved human boundaries, and next inputs needed for recovery.",
     }
 
@@ -3306,6 +4870,7 @@ def build_closeout_attestation(
             validation_receipts
             + manifest.get("receipts", {}).get("validation", [])
         ))
+    validation_bindings = getattr(args, "validation_receipt_bindings", None)
     return {
         "schema": CLOSEOUT_ATTESTATION_SCHEMA,
         "schema_version": "1",
@@ -3336,8 +4901,17 @@ def build_closeout_attestation(
             "impact": canonical_json_digest(impact_receipt) if impact_receipt else None,
             "semantic_review": semantic_review_binding,
             "freeze": canonical_json_digest(freeze_receipt) if freeze_receipt else None,
-            "validation": validation_receipts,
+            "validation": (
+                validation_bindings
+                if validation_bindings is not None
+                else validation_receipts
+            ),
         },
+        "work_map_binding": (
+            manifest.get("work_map_binding")
+            if manifest is not None
+            else None
+        ),
         "result_reasons": list(payload.get("result_reasons", [])),
         "recovery_actions": list(payload.get("recovery_actions", [])),
         "limitations": list((payload.get("coverage") or {}).get("cannot_prove", [])),
@@ -3471,6 +5045,32 @@ def closeout_command(args: argparse.Namespace) -> None:
             validation_receipts,
             Path(args.workspace),
         )
+        if manifest is not None and manifest.get("work_map_binding") is not None:
+            freeze_payload = receipt_payload_from_args(args, kind="freeze")
+            structured_bindings: list[dict] = []
+            if not isinstance(freeze_payload, dict):
+                validation_findings.append({
+                    "code": "validation-receipt-freeze-missing",
+                })
+            else:
+                for raw_path in sorted(set(validation_receipts)):
+                    candidate = Path(raw_path)
+                    target = (
+                        candidate
+                        if candidate.is_absolute()
+                        else Path(args.workspace) / candidate
+                    )
+                    binding, strict_findings = (
+                        validate_structured_validation_receipt(
+                            target,
+                            Path(args.workspace),
+                            freeze_payload,
+                        )
+                    )
+                    validation_findings.extend(strict_findings)
+                    if binding is not None:
+                        structured_bindings.append(binding)
+            args.validation_receipt_bindings = structured_bindings
         if validation_findings:
             payload["mechanical_findings"].extend(validation_findings)
             payload["result"] = "fail"
@@ -3640,10 +5240,59 @@ def build_parser() -> argparse.ArgumentParser:
     )
     closeout.set_defaults(func=closeout_command)
 
+    controlled_archive = sub.add_parser("controlled-archive")
+    controlled_archive.add_argument("adapter")
+    controlled_archive.add_argument("--workspace", required=True)
+    controlled_archive.add_argument("--request", required=True)
+    controlled_archive.add_argument("--write-receipt", required=True)
+    controlled_archive.set_defaults(func=controlled_archive_command)
+
     diagnose_parser = sub.add_parser("diagnose")
     diagnose_parser.add_argument("adapter")
     diagnose_parser.add_argument("--workspace", required=True)
     diagnose_parser.set_defaults(func=diagnose_command)
+
+    work_map = sub.add_parser("work-map")
+    work_map_sub = work_map.add_subparsers(
+        required=True,
+        dest="work_map_action",
+    )
+    work_map_check = work_map_sub.add_parser("check")
+    work_map_check.add_argument("adapter")
+    work_map_check.add_argument("--workspace", required=True)
+    work_map_check.set_defaults(func=work_map_command)
+
+    work_map_start = work_map_sub.add_parser("start")
+    work_map_start.add_argument("adapter")
+    work_map_start.add_argument("--workspace", required=True)
+    work_map_start.add_argument("--item", required=True)
+    work_map_start.add_argument("--task-id", required=True)
+    work_map_start.set_defaults(func=work_map_command)
+
+    work_map_finish = work_map_sub.add_parser("finish")
+    work_map_finish.add_argument("adapter")
+    work_map_finish.add_argument("--workspace", required=True)
+    work_map_finish.add_argument("--item", required=True)
+    work_map_finish.add_argument("--task-id", required=True)
+    work_map_finish.add_argument(
+        "--disposition",
+        required=True,
+        choices=[
+            "completed",
+            "transferred",
+            "blocked",
+            "deferred",
+            "cancelled",
+            "superseded",
+        ],
+    )
+    work_map_finish.set_defaults(func=work_map_command)
+
+    work_map_render = work_map_sub.add_parser("render")
+    work_map_render.add_argument("adapter")
+    work_map_render.add_argument("--workspace", required=True)
+    work_map_render.add_argument("--format", required=True, choices=["table", "mermaid"])
+    work_map_render.set_defaults(func=work_map_command)
 
     return parser
 
