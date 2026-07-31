@@ -19,6 +19,13 @@ facts.
 - `human_approval`: human decision categories.
 - `plan_status_checks`: optional consistency checks between a current status
   document and mapped plan files.
+- `controlled_archive`: optional single-file active-to-archive intake
+  configuration.
+- `work_map`: optional Markdown Work Map configuration. It declares `path`,
+  exact `heading`, nine semantic `columns`, explicit `shared_columns`,
+  `null_markers`, `multi_value_separator`, commitment and progress
+  classifications, task identity policy, decision-item pattern, current and
+  historical attestation schemas, and generated-view markers.
 
 `entrypoints`, `boundaries`, and `human_approval` are required. `current` and
 `evidence` entrypoints must be non-empty lists. All path lists contain strings.
@@ -62,6 +69,140 @@ Closeout also returns additive schema-1 fields:
 
 `fail` is reserved for deterministic defects. Semantic uncertainty or missing
 human approval is `unproven`.
+
+## Controlled Archive Contract
+
+Controlled archive intake is independent of Impact, Freeze, Closeout,
+`--authorized-path`, protected approvals, and ordinary historical-change
+approvals. It never runs automatically. Adapter schema remains `"1"`.
+
+Configure the allowed transition:
+
+```json
+{
+  "controlled_archive": {
+    "source_roots": ["docs/current/"],
+    "archive_roots": ["docs/archive/"],
+    "approval_type": "deletion or irreversible archive handling"
+  }
+}
+```
+
+Declare `approval_type` in `human_approval`. Every `archive_roots` entry must
+be covered by `boundaries.excluded`; this keeps ordinary inventory and
+Closeout behavior fail-closed after intake. Source roots must not overlap
+excluded, protected, historical, or archive roots.
+
+Submit exactly one mapping in a JSON request:
+
+```json
+{
+  "schema": "govern-ai-coding.archive-request.v1",
+  "schema_version": "1",
+  "mapping": {
+    "source": "docs/current/old.md",
+    "target": "docs/archive/old.md"
+  },
+  "reason": "The approved replacement now owns this guidance.",
+  "authority_disposition": {
+    "kind": "replacement",
+    "replacement": "docs/current/new.md",
+    "statement": "Current authority transfers to the replacement."
+  },
+  "approval": {
+    "type": "deletion or irreversible archive handling",
+    "evidence": "docs/decisions/archive-approval.md"
+  },
+  "references": {
+    "status": "updated",
+    "legacy": []
+  }
+}
+```
+
+`authority_disposition.kind` is `replacement`, `authority-transfer`, or
+`no-replacement`. The first two require an existing active `replacement` path.
+`no-replacement` omits that path and uses `statement` to record why no
+successor exists.
+
+Approval evidence must be an ordinary, active, non-generated document. It
+records non-empty `Approval type:`, `Object:`, `Scope:`, and
+`Does not approve:` fields; the object names both source and target. The
+checker binds the declared evidence and digest but does not prove human
+identity.
+
+The checker scans explicit active files and every regular UTF-8 file below
+active directory entrypoints and authority pointers for the source path,
+including local Markdown links resolving to it. An unreadable or non-UTF-8 file
+in that scope blocks intake rather than becoming a reference blind spot. Use
+`references.status: "updated"` only when no references remain. Otherwise use
+`"legacy-dispositions"` and list every discovered `path` and `line` with a
+non-empty `resolution`.
+
+Run the dedicated operation with a request and an unused receipt path. Both
+the target parent and receipt parent must already exist. The receipt path must
+be outside the workspace or under an excluded boundary.
+
+Preflight rejects:
+
+- missing, non-file, inactive, excluded, protected, historical, or symlinked
+  sources;
+- targets outside a configured archive root, existing targets, missing target
+  parents, path traversal, placeholders, globs, or symlink traversal;
+- missing exit reason, incomplete authority disposition, missing or mismatched
+  approval evidence, and unhandled active references;
+- existing receipt destinations.
+
+After preflight, the operation atomically retires the source to private
+same-directory staging, creates the target without overwrite, verifies
+identical SHA-256 content, and writes the receipt exclusively. It keeps the
+staged source until final target, receipt, and parent-directory identity checks
+pass. Failure triggers identity-checked rollback; it never deletes a
+concurrently replaced path or treats an archived path as a source. The archive
+copy receives independent bytes rather than sharing a hard-linked inode with
+an active path.
+
+Schema `govern-ai-coding.archive-receipt.v1` records adapter and workspace
+identity, request digest, source and target, archive reason, authority
+disposition, approval type/evidence/digest, before and after content digests,
+reference discoveries and dispositions, execution result, and recovery
+instructions. Recovery copies verified archive bytes to a new unoccupied
+active path under separate explicit approval; it does not modify or remove the
+archived target.
+
+## Optional Work Map Contract
+
+Required `work_map.columns` keys are `id`, `parent`, `result`, `commitment`,
+`progress`, `owner_task`, `dependencies`, `next_reentry`, and
+`authority_evidence`. Two semantic fields may share a physical header only
+when that header is declared in `shared_columns`. All vocabulary is
+adapter-owned; the core does not hard-code project languages or status words.
+
+`work-map check|start|finish|render` returns `result`, source path/heading/table
+digest, target, ordered checks, proposed fields, unified patch, recovery
+actions, and claim boundary. Commands never mutate the workspace.
+
+An event manifest may add:
+
+```json
+{
+  "work_map_binding": {
+    "item_id": "ITEM-01",
+    "task_id": "019fb5c7-3361-76b2-8908-40bc995f084b",
+    "source_digest": "64 lowercase hexadecimal characters",
+    "expected_disposition": "completed",
+    "attestation_path": "/safe/external/attestation.json"
+  }
+}
+```
+
+With this binding, unplanned actual paths fail, unused planned paths warn, and
+Closeout requires `govern-ai-coding.validation-receipt.v1`. That receipt must
+have result `pass`, bind the canonical Freeze digest and every frozen path
+digest, list passing commands and environment, and state supported and
+unsupported claims. The immutable attestation binds its canonical content
+digest. Events without `work_map_binding` retain the schema-1 legacy validation
+pointer behavior.
 
 Missing adapter files return `unproven` with `adapter-missing` rather than a
 traceback. Create a candidate adapter from project pointers and ask for human

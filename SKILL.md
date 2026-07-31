@@ -125,6 +125,54 @@ Impact result:
   missing or uncertain, or excluded paths are touched;
 - `fail` only for directly provable structural defects.
 
+## Optional Work Map
+
+When an adapter declares `work_map`, treat its configured Markdown table as
+the sole project work-state authority. The `work-map` commands are read-only:
+
+```bash
+python3 scripts/govern_ai_coding.py work-map check adapter.json --workspace /project
+python3 scripts/govern_ai_coding.py work-map start adapter.json --workspace /project \
+  --item ITEM-01 --task-id 019fb5c7-3361-76b2-8908-40bc995f084b
+python3 scripts/govern_ai_coding.py work-map finish adapter.json --workspace /project \
+  --item ITEM-01 --task-id 019fb5c7-3361-76b2-8908-40bc995f084b \
+  --disposition completed
+python3 scripts/govern_ai_coding.py work-map render adapter.json --workspace /project \
+  --format mermaid
+```
+
+`start` and `finish` emit a transition packet and unified patch. They never
+edit the source, allocate a task ID, assign work, or close an external task.
+The same active task is an idempotent pass/no-op; a different task is a
+conflict. Table and Mermaid renderers consume the same normalized source-table
+model, and generated views never become input.
+
+An event manifest may bind `work_map_binding`. In that opt-in mode Closeout
+also reconciles Impact-planned and actual paths and requires a structured
+validation receipt bound to the exact Freeze. Historical
+`govern-project-docs` attestations may be classified as historical evidence
+only; they are not accepted as current protocol receipts.
+
+## Controlled Archive Intake
+
+Use the independent `controlled-archive` operation only when a user explicitly
+approves moving one active file into an adapter-configured immutable archive.
+Never trigger it from Closeout or express it through `--authorized-path`,
+protected-path approval, or ordinary historical-change approval.
+
+Before running it, read the Controlled Archive Contract in
+`references/adapter-schema.md`. Provide one exact source-to-target request that
+records the exit reason, replacement or authority disposition, approval
+evidence, and reference handling. The operation validates every input before
+moving bytes, refuses overwrite and symlink traversal, preserves the content
+digest, and writes an exclusive recovery-bearing receipt.
+
+Keep every archive root under the adapter's excluded boundary. Impact, Freeze,
+and Closeout retain their normal behavior; the archive receipt does not
+authorize later edits to the archived target. Use a separate explicitly
+approved recovery event to copy verified archive bytes to an unoccupied active
+path without changing the archive.
+
 ## Closeout
 
 Run Closeout before declaring a task, batch, decision, validation change, or
