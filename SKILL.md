@@ -155,23 +155,37 @@ only; they are not accepted as current protocol receipts.
 
 ## Controlled Archive Intake
 
-Use the independent `controlled-archive` operation only when a user explicitly
-approves moving one active file into an adapter-configured immutable archive.
-Never trigger it from Closeout or express it through `--authorized-path`,
-protected-path approval, or ordinary historical-change approval.
+Read the full
+[Controlled Archive Protocol](references/controlled-archive.md) before using
+this capability.
 
-Before running it, read the Controlled Archive Contract in
-`references/adapter-schema.md`. Provide one exact source-to-target request that
-records the exit reason, replacement or authority disposition, approval
-evidence, and reference handling. The operation validates every input before
-moving bytes, refuses overwrite and symlink traversal, preserves the content
-digest, and writes an exclusive recovery-bearing receipt.
+Document review, stale-material checks, dependency analysis, candidate
+identification, and archive preflight are read-only. A Skill trigger, candidate
+approval, or passing preflight is not approval to move a file.
 
-Keep every archive root under the adapter's excluded boundary. Impact, Freeze,
-and Closeout retain their normal behavior; the archive receipt does not
-authorize later edits to the archived target. Use a separate explicitly
-approved recovery event to copy verified archive bytes to an unoccupied active
-path without changing the archive.
+Those read-only events and ordinary governance events must not create, reissue,
+or reuse an execution grant. A grant must preserve a current explicit user
+execution instruction and bind it to the exact operation scope.
+
+Run an archive write only after the user has expressed verifiable execution
+intent, the exact source/target/receipt scope is fixed, the irreversible and
+non-atomic boundaries are acknowledged, exact approval evidence exists, the
+adapter permits the operation, and a separately bound execution grant
+validates. Otherwise return candidates, risks, and the confirmation still
+needed.
+
+Never infer archive execution from Impact, Freeze, Closeout, diagnose, link or
+consistency checks, task completion, session end, or proactive discovery.
+Those operations must not call the archive executor or modify excluded archive
+paths.
+
+Every actual move remains an independent single-file transaction: never
+overwrite; verify identical content; retain the source or complete
+identity-checked recovery on failure; publish an exclusive immutable receipt;
+bind the source content and actual archive-root identity before execution;
+never promise multi-file atomicity, roll back completed task items, rewrite
+historical evidence, modify archive content, or change protected
+configuration automatically. Uncertainty remains fail-closed.
 
 ## Closeout
 

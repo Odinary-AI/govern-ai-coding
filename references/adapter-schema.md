@@ -72,18 +72,39 @@ human approval is `unproven`.
 
 ## Controlled Archive Contract
 
-Controlled archive intake is independent of Impact, Freeze, Closeout,
-`--authorized-path`, protected approvals, and ordinary historical-change
-approvals. It never runs automatically. Adapter schema remains `"1"`.
-
-Configure the allowed transition:
+The complete request, grant, preflight, task, amendment, receipt, lifecycle,
+result-normalization, and migration contracts are in
+[Controlled Archive Protocol](controlled-archive.md). Adapter schema remains
+`"1"` and all additions below are optional.
 
 ```json
 {
   "controlled_archive": {
-    "source_roots": ["docs/current/"],
-    "archive_roots": ["docs/archive/"],
-    "approval_type": "deletion or irreversible archive handling"
+    "source_roots": ["<active-root>"],
+    "archive_roots": ["<archive-root>"],
+    "approval_type": "<approval-type>",
+    "reference_rules": [
+      {
+        "id": "<rule-id>",
+        "selectors": ["entrypoints.current"],
+        "patterns": ["<optional-pattern>"],
+        "category": "current-dependency",
+        "handling": "disposition-required"
+      }
+    ],
+    "mapping_amendment_policies": [
+      {
+        "id": "<policy-id>",
+        "allowed_changed_fields": ["target"],
+        "supplemental_approval_type": "<supplemental-approval-type>"
+      }
+    ],
+    "authorization_scopes": [
+      {
+        "id": "<authorization-id>",
+        "source_roots": ["<active-root>"]
+      }
+    ]
   }
 }
 ```
@@ -91,84 +112,19 @@ Configure the allowed transition:
 Declare `approval_type` in `human_approval`. Every `archive_roots` entry must
 be covered by `boundaries.excluded`; this keeps ordinary inventory and
 Closeout behavior fail-closed after intake. Source roots must not overlap
-excluded, protected, historical, or archive roots.
+excluded, protected, historical, or archive roots. Archive roots must not
+overlap each other because every move and amendment binds one unambiguous
+archive-root identity.
 
-Submit exactly one mapping in a JSON request:
-
-```json
-{
-  "schema": "govern-ai-coding.archive-request.v1",
-  "schema_version": "1",
-  "mapping": {
-    "source": "docs/current/old.md",
-    "target": "docs/archive/old.md"
-  },
-  "reason": "The approved replacement now owns this guidance.",
-  "authority_disposition": {
-    "kind": "replacement",
-    "replacement": "docs/current/new.md",
-    "statement": "Current authority transfers to the replacement."
-  },
-  "approval": {
-    "type": "deletion or irreversible archive handling",
-    "evidence": "docs/decisions/archive-approval.md"
-  },
-  "references": {
-    "status": "updated",
-    "legacy": []
-  }
-}
-```
-
-`authority_disposition.kind` is `replacement`, `authority-transfer`, or
-`no-replacement`. The first two require an existing active `replacement` path.
-`no-replacement` omits that path and uses `statement` to record why no
-successor exists.
-
-Approval evidence must be an ordinary, active, non-generated document. It
-records non-empty `Approval type:`, `Object:`, `Scope:`, and
-`Does not approve:` fields; the object names both source and target. The
-checker binds the declared evidence and digest but does not prove human
-identity.
-
-The checker scans explicit active files and every regular UTF-8 file below
-active directory entrypoints and authority pointers for the source path,
-including local Markdown links resolving to it. An unreadable or non-UTF-8 file
-in that scope blocks intake rather than becoming a reference blind spot. Use
-`references.status: "updated"` only when no references remain. Otherwise use
-`"legacy-dispositions"` and list every discovered `path` and `line` with a
-non-empty `resolution`.
-
-Run the dedicated operation with a request and an unused receipt path. Both
-the target parent and receipt parent must already exist. The receipt path must
-be outside the workspace or under an excluded boundary.
-
-Preflight rejects:
-
-- missing, non-file, inactive, excluded, protected, historical, or symlinked
-  sources;
-- targets outside a configured archive root, existing targets, missing target
-  parents, path traversal, placeholders, globs, or symlink traversal;
-- missing exit reason, incomplete authority disposition, missing or mismatched
-  approval evidence, and unhandled active references;
-- existing receipt destinations.
-
-After preflight, the operation atomically retires the source to private
-same-directory staging, creates the target without overwrite, verifies
-identical SHA-256 content, and writes the receipt exclusively. It keeps the
-staged source until final target, receipt, and parent-directory identity checks
-pass. Failure triggers identity-checked rollback; it never deletes a
-concurrently replaced path or treats an archived path as a source. The archive
-copy receives independent bytes rather than sharing a hard-linked inode with
-an active path.
-
-Schema `govern-ai-coding.archive-receipt.v1` records adapter and workspace
-identity, request digest, source and target, archive reason, authority
-disposition, approval type/evidence/digest, before and after content digests,
-reference discoveries and dispositions, execution result, and recovery
-instructions. Recovery copies verified archive bytes to a new unoccupied
-active path under separate explicit approval; it does not modify or remove the
-archived target.
+Reference rule categories are open identifiers. Handling is
+`disposition-required`, `trace-only`, or `human-review`. Unknown or conflicting
+classification fails closed. `mapping_amendment_policies` can permit a
+separately evidenced mechanical target correction; source, authority,
+visibility, actual archive-root identity, archive-root class, approval, or
+recovery-boundary changes always require new explicit approval.
+`authorization_scopes` support read-only lifecycle reporting, must remain
+inside configured active source roots without crossing inactive boundaries,
+and never authorize automatic configuration edits.
 
 ## Optional Work Map Contract
 

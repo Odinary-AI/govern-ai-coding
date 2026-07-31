@@ -14,8 +14,81 @@ import stat
 import subprocess
 import sys
 import tempfile
+import unicodedata
 from pathlib import Path
 from urllib.parse import unquote, urlparse
+
+try:
+    from controlled_archive import (
+        AMENDMENT_SCHEMA,
+        EXECUTION_GRANT_SCHEMA,
+        TASK_SCHEMA,
+        TASK_GRANT_SCHEMA,
+        archive_authorization_lifecycle,
+        build_archive_preflight,
+        canonical_json_digest as archive_protocol_digest,
+        classify_archive_references,
+        global_archive_preflight,
+        normalize_archive_result,
+        reconcile_archive_task,
+        runtime_capability_report,
+        structured_archive_exception,
+        validate_archive_task_manifest,
+        validate_execution_grant,
+        validate_task_execution_grant,
+        validate_mapping_amendment,
+        validate_receipt_grant_binding,
+        validate_reference_rules,
+    )
+except ModuleNotFoundError:
+    _archive_protocol_path = Path(__file__).with_name("controlled_archive.py")
+    _archive_protocol_spec = importlib.util.spec_from_file_location(
+        "govern_ai_coding_controlled_archive",
+        _archive_protocol_path,
+    )
+    if _archive_protocol_spec is None or _archive_protocol_spec.loader is None:
+        raise
+    _archive_protocol_module = importlib.util.module_from_spec(
+        _archive_protocol_spec
+    )
+    _archive_protocol_spec.loader.exec_module(_archive_protocol_module)
+    AMENDMENT_SCHEMA = _archive_protocol_module.AMENDMENT_SCHEMA
+    EXECUTION_GRANT_SCHEMA = _archive_protocol_module.EXECUTION_GRANT_SCHEMA
+    TASK_SCHEMA = _archive_protocol_module.TASK_SCHEMA
+    TASK_GRANT_SCHEMA = _archive_protocol_module.TASK_GRANT_SCHEMA
+    archive_authorization_lifecycle = (
+        _archive_protocol_module.archive_authorization_lifecycle
+    )
+    build_archive_preflight = _archive_protocol_module.build_archive_preflight
+    archive_protocol_digest = _archive_protocol_module.canonical_json_digest
+    classify_archive_references = (
+        _archive_protocol_module.classify_archive_references
+    )
+    global_archive_preflight = _archive_protocol_module.global_archive_preflight
+    normalize_archive_result = _archive_protocol_module.normalize_archive_result
+    reconcile_archive_task = _archive_protocol_module.reconcile_archive_task
+    runtime_capability_report = (
+        _archive_protocol_module.runtime_capability_report
+    )
+    structured_archive_exception = (
+        _archive_protocol_module.structured_archive_exception
+    )
+    validate_archive_task_manifest = (
+        _archive_protocol_module.validate_archive_task_manifest
+    )
+    validate_execution_grant = (
+        _archive_protocol_module.validate_execution_grant
+    )
+    validate_task_execution_grant = (
+        _archive_protocol_module.validate_task_execution_grant
+    )
+    validate_mapping_amendment = (
+        _archive_protocol_module.validate_mapping_amendment
+    )
+    validate_receipt_grant_binding = (
+        _archive_protocol_module.validate_receipt_grant_binding
+    )
+    validate_reference_rules = _archive_protocol_module.validate_reference_rules
 
 try:
     from work_map import (
@@ -258,6 +331,15 @@ def validate_controlled_archive_config(adapter: dict) -> list[dict]:
                     "source_root": source_root,
                     "archive_root": archive_root,
                 })
+    archive_roots = normalized.get("archive_roots", [])
+    for index, first in enumerate(archive_roots):
+        for second in archive_roots[index + 1:]:
+            if path_matches(first, second) or path_matches(second, first):
+                findings.append({
+                    "code": "controlled-archive-roots-overlap",
+                    "archive_roots": [first, second],
+                })
+    findings.extend(validate_reference_rules(adapter))
     return findings
 
 
@@ -1856,7 +1938,7 @@ def archive_path(
 def active_reference_docs(
     adapter: dict,
     workspace: Path,
-) -> tuple[list[Path], list[dict]]:
+) -> tuple[list[dict], list[dict]]:
     workspace = workspace.resolve()
     excluded = safe_section(adapter, "boundaries").get("excluded", [])
     historical = safe_section(adapter, "entrypoints").get("historical", [])
@@ -1865,45 +1947,96 @@ def active_reference_docs(
         [],
     )
     inactive_patterns = [*excluded, *historical, *archive_roots]
-    pointers: list[str] = []
+    pointers: list[tuple[str, str, bool]] = []
     current = safe_section(adapter, "entrypoints").get("current", [])
     if is_string_list(current):
-        pointers.extend(current)
+        pointers.extend(
+            (pointer, "entrypoints.current", False)
+            for pointer in current
+        )
     for rule in safe_rule_list(adapter):
         if is_string_list(rule.get("paths")):
-            pointers.extend(rule["paths"])
+            pointers.extend(
+                (
+                    pointer,
+                    f"authority_rules.{rule.get('id', 'unidentified')}",
+                    False,
+                )
+                for pointer in rule["paths"]
+            )
 
-    documents: list[Path] = []
+    configured_rules = safe_section(
+        adapter,
+        "controlled_archive",
+    ).get("reference_rules", [])
+    if isinstance(configured_rules, list):
+        for reference_rule in configured_rules:
+            if not isinstance(reference_rule, dict):
+                continue
+            for selector in reference_rule.get("selectors", []):
+                selector_pointers: list[str] = []
+                if selector.startswith("entrypoints."):
+                    key = selector.split(".", 1)[1]
+                    value = safe_section(adapter, "entrypoints").get(key, [])
+                    if is_string_list(value):
+                        selector_pointers.extend(value)
+                elif selector == "authority_rules":
+                    for authority_rule in safe_rule_list(adapter):
+                        if is_string_list(authority_rule.get("paths")):
+                            selector_pointers.extend(authority_rule["paths"])
+                elif selector.startswith("authority_rules."):
+                    identifier = selector.split(".", 1)[1]
+                    for authority_rule in safe_rule_list(adapter):
+                        if (
+                            authority_rule.get("id") == identifier
+                            and is_string_list(authority_rule.get("paths"))
+                        ):
+                            selector_pointers.extend(authority_rule["paths"])
+                allow_inactive = selector in {
+                    "entrypoints.evidence",
+                    "entrypoints.historical",
+                }
+                pointers.extend(
+                    (pointer, selector, allow_inactive)
+                    for pointer in selector_pointers
+                )
+
+    document_selectors: dict[Path, set[str]] = {}
     findings: list[dict] = []
-    seen: set[Path] = set()
-    for pointer in sorted(set(pointers)):
+    for pointer, selector, allow_inactive in sorted(set(pointers)):
         normalized_pointer, pointer_finding = normalize_path_value(
             pointer,
-            "active_reference_root",
+            "reference_root",
         )
         if pointer_finding or normalized_pointer is None:
             findings.append(pointer_finding or {
-                "code": "invalid-active-reference-root",
+                "code": "invalid-reference-root",
                 "path": pointer,
             })
             continue
-        if any(
+        if not allow_inactive and any(
             path_matches(normalized_pointer, pattern)
             for pattern in inactive_patterns
         ):
             continue
-        path, finding = archive_path(workspace, pointer, "active_reference_root")
+        path, finding = archive_path(workspace, pointer, "reference_root")
         if finding or path is None:
             findings.append(finding or {
-                "code": "invalid-active-reference-root",
+                "code": "invalid-reference-root",
                 "path": pointer,
             })
             continue
         pointer_is_file = path.is_file()
         if not path.exists():
             findings.append({
-                "code": "active-reference-pointer-missing",
+                "code": (
+                    "active-reference-pointer-missing"
+                    if selector == "entrypoints.current"
+                    or selector.startswith("authority_rules.")
+                    else "reference-pointer-missing"
+                ),
                 "path": normalized_pointer,
+                "selector": selector,
             })
             continue
         candidates = [path] if pointer_is_file else (
@@ -1916,25 +2049,36 @@ def active_reference_docs(
                 relative = candidate.relative_to(workspace).as_posix()
             except ValueError:
                 continue
-            if any(path_matches(relative, pattern) for pattern in inactive_patterns):
+            if not allow_inactive and any(
+                path_matches(relative, pattern)
+                for pattern in inactive_patterns
+            ):
                 continue
             safe_candidate, candidate_finding = archive_path(
                 workspace,
                 relative,
-                "active_reference_path",
+                "reference_path",
             )
             if candidate_finding or safe_candidate is None:
                 findings.append(candidate_finding or {
-                    "code": "invalid-active-reference-path",
+                    "code": "invalid-reference-path",
                     "path": relative,
                 })
                 continue
             if not safe_candidate.is_file():
                 continue
             resolved = safe_candidate.resolve()
-            if resolved not in seen:
-                seen.add(resolved)
-                documents.append(safe_candidate)
+            document_selectors.setdefault(resolved, set()).add(selector)
+    documents = [
+        {
+            "path": path,
+            "selectors": sorted(selectors),
+        }
+        for path, selectors in sorted(
+            document_selectors.items(),
+            key=lambda item: str(item[0]),
+        )
+    ]
     return documents, findings
 
 
@@ -1946,7 +2090,9 @@ def discover_active_references(
 ) -> tuple[list[dict], list[dict], list[str]]:
     documents, findings = active_reference_docs(adapter, workspace)
     references: list[dict] = []
-    for document in documents:
+    for record in documents:
+        document = record["path"]
+        selectors = record["selectors"]
         if document.resolve() == source_path.resolve():
             continue
         relative_doc = document.relative_to(workspace.resolve()).as_posix()
@@ -1967,26 +2113,34 @@ def discover_active_references(
             continue
         for line_number, line in enumerate(lines, start=1):
             matched = source in line
+            match_form = "text"
+            column = line.find(source) + 1 if matched else 0
             if not matched:
                 for link in markdown_links(line):
                     if not is_local_link(link):
                         continue
                     if resolve_link(document, link) == source_path.resolve():
                         matched = True
+                        match_form = "link"
+                        column = line.find(link) + 1
                         break
             if matched:
                 references.append({
                     "path": relative_doc,
                     "line": line_number,
+                    "column": column,
+                    "match_form": match_form,
+                    "selector": selectors[0],
+                    "selectors": selectors,
                 })
     unique = {
         (reference["path"], reference["line"]): reference
         for reference in references
     }
     scanned = sorted(
-        document.relative_to(workspace.resolve()).as_posix()
-        for document in documents
-        if document.resolve() != source_path.resolve()
+        record["path"].relative_to(workspace.resolve()).as_posix()
+        for record in documents
+        if record["path"].resolve() != source_path.resolve()
     )
     return [unique[key] for key in sorted(unique)], findings, scanned
 
@@ -2074,6 +2228,8 @@ def archive_failure(
     unverified: list[str],
     human_required: list[str],
     mapping: dict | None = None,
+    references: dict | None = None,
+    runtime: dict | None = None,
     recovery: str,
 ) -> dict:
     return {
@@ -2085,6 +2241,8 @@ def archive_failure(
         "controlled_archive": {
             "mapping": mapping,
             "moved": False,
+            "references": references or {},
+            "runtime": runtime,
         },
         "archive_receipt": None,
         "receipt_output": None,
@@ -2138,7 +2296,7 @@ def descriptor_matches_path(
     path: Path,
 ) -> bool:
     try:
-        path_stat = path.stat(follow_symlinks=False)
+        path_stat = os.stat(path, follow_symlinks=False)
     except FileNotFoundError:
         return False
     descriptor_stat = os.fstat(descriptor)
@@ -2239,6 +2397,11 @@ def execute_controlled_archive(
     workspace: Path,
     request: dict,
     receipt_destination: Path,
+    execution_grant: dict | None = None,
+    amendment: dict | None = None,
+    original_execution_grant: dict | None = None,
+    *,
+    read_only: bool = False,
 ) -> dict:
     workspace = workspace.resolve()
     config = safe_section(adapter, "controlled_archive")
@@ -2336,6 +2499,23 @@ def execute_controlled_archive(
             "code": "archive-target-outside-configured-root",
             "path": target,
         })
+    matched_archive_roots = [
+        root for root in archive_roots
+        if target and path_matches(target, root)
+    ]
+    if target and len(matched_archive_roots) != 1:
+        mechanical.append({
+            "code": "archive-target-root-identity-ambiguous",
+            "path": target,
+            "matched_roots": matched_archive_roots,
+        })
+    archive_root_sha256 = (
+        archive_protocol_digest({
+            "archive_root": matched_archive_roots[0],
+        })
+        if len(matched_archive_roots) == 1
+        else None
+    )
     if source == target and source:
         mechanical.append({
             "code": "archive-source-equals-target",
@@ -2453,6 +2633,16 @@ def execute_controlled_archive(
     )
     approval_digest = None
     normalized_evidence = None
+    approval_source = source
+    approval_target = target
+    if isinstance(amendment, dict):
+        amendment_original = amendment.get("original_mapping")
+        if (
+            isinstance(amendment_original, dict)
+            and amendment_original.get("source") == source
+            and isinstance(amendment_original.get("target"), str)
+        ):
+            approval_target = amendment_original["target"]
     if (
         not isinstance(approval, dict)
         or approval.get("type") != approval_type
@@ -2512,8 +2702,8 @@ def execute_controlled_archive(
                         or not text_records_archive_approval(
                             evidence_text,
                             approval_type,
-                            source,
-                            target,
+                            approval_source,
+                            approval_target,
                         )
                     ):
                         unverified.append("archive-approval-scope-mismatch")
@@ -2542,7 +2732,89 @@ def execute_controlled_archive(
         validate_archive_references(request, discovered, scanned_paths)
     )
     mechanical.extend(declaration_findings)
-    unverified.extend(reference_unverified)
+    configured_reference_rules = config.get("reference_rules", [])
+    if configured_reference_rules:
+        classified = classify_archive_references(
+            adapter,
+            discovered,
+            [
+                {
+                    "selector": selector,
+                    "paths": scanned_paths,
+                    "files_scanned": len(scanned_paths),
+                }
+                for selector in sorted({
+                    selector
+                    for item in discovered
+                    for selector in item.get(
+                        "selectors",
+                        [item.get("selector")],
+                    )
+                    if isinstance(selector, str)
+                } or {"entrypoints.current"})
+            ],
+        )
+        dispositions = {
+            (item.get("path"), item.get("line"))
+            for item in reference_summary.get("dispositions", [])
+        }
+        for item in classified["discovered"]:
+            if (item.get("path"), item.get("line")) in dispositions:
+                item["disposition"] = "provided"
+                item["required_action"] = "none"
+        classified["blocking"] = [
+            item for item in classified["discovered"]
+            if item.get("handling") != "trace-only"
+            and item.get("disposition") != "provided"
+        ]
+        classified["required_actions"] = [
+            {
+                "path": item.get("path"),
+                "line": item.get("line"),
+                "column": item.get("column"),
+                "category": item.get("category"),
+                "action": item.get("required_action"),
+            }
+            for item in classified["blocking"]
+        ]
+        reference_summary.update(classified)
+        if classified["blocking"]:
+            unverified.append("archive-references-unresolved")
+    else:
+        declared_locations = {
+            (item.get("path"), item.get("line"))
+            for item in reference_summary.get("dispositions", [])
+        }
+        for item in reference_summary.get("discovered", []):
+            item["category"] = "current-dependency"
+            item["handling"] = "disposition-required"
+            item["disposition"] = (
+                "provided"
+                if (item.get("path"), item.get("line")) in declared_locations
+                else "unresolved"
+            )
+            item["required_action"] = (
+                "none"
+                if item["disposition"] == "provided"
+                else "provide an exact disposition for this current dependency"
+            )
+        reference_summary["scanned_scopes"] = [{
+            "selector": "entrypoints.current",
+            "paths": scanned_paths,
+            "files_scanned": len(scanned_paths),
+        }]
+        reference_summary["required_actions"] = [
+            {
+                "path": item.get("path"),
+                "line": item.get("line"),
+                "column": item.get("column"),
+                "category": item.get("category"),
+                "action": item.get("required_action"),
+            }
+            for item in reference_summary.get("discovered", [])
+            if item.get("disposition") != "provided"
+        ]
+        unverified.extend(reference_unverified)
 
     destination, receipt_findings = resolve_receipt_output_path(
         str(receipt_destination),
@@ -2562,24 +2834,99 @@ def execute_controlled_archive(
                 "path": str(destination.parent),
             })
 
+    normalized_disposition = {
+        "kind": disposition_kind,
+        "replacement": normalized_replacement,
+        "statement": (
+            disposition_statement.strip()
+            if isinstance(disposition_statement, str)
+            else ""
+        ),
+    }
+    source_sha256 = None
+    source_size = None
+    if (
+        source_path is not None
+        and source_path.is_file()
+        and not source_path.is_symlink()
+    ):
+        try:
+            source_sha256 = file_digest(source_path)
+            source_size = os.stat(
+                source_path,
+                follow_symlinks=False,
+            ).st_size
+        except OSError as exc:
+            mechanical.append({
+                "code": "archive-source-identity-unavailable",
+                "path": source,
+                "message": str(exc),
+            })
+    receipt_binding = str(receipt_destination)
+    if destination is not None:
+        try:
+            receipt_binding = destination.relative_to(workspace).as_posix()
+        except ValueError:
+            receipt_binding = str(destination)
+    operation = {
+        "source": source,
+        "target": target,
+        "receipt": receipt_binding,
+        "source_sha256": source_sha256,
+        "source_size": source_size,
+        "archive_root_sha256": archive_root_sha256,
+        "authority_disposition_sha256": archive_protocol_digest(
+            normalized_disposition
+        ),
+    }
+    runtime = runtime_capability_report(
+        workspace,
+        [operation],
+        read_only=True,
+    )
+    if runtime["result"] != "pass":
+        mechanical.extend(runtime["diagnostics"])
+    preflight = build_archive_preflight(
+        request=request,
+        mapping=normalized_mapping,
+        runtime=runtime,
+        references=reference_summary,
+        findings=mechanical,
+        unverified=unverified,
+        approval_digest=approval_digest,
+    )
+    preflight["operation"] = operation
+    preflight["preflight_sha256"] = archive_protocol_digest({
+        "base_preflight_sha256": preflight["preflight_sha256"],
+        "operation": operation,
+    })
+
     if mechanical:
-        return archive_failure(
+        failure = archive_failure(
             result="fail",
             mechanical=mechanical,
             unverified=unverified,
             human_required=human_required,
             mapping=normalized_mapping,
+            references=reference_summary,
+            runtime=runtime,
             recovery="Fix the controlled archive request and adapter findings; no file was moved.",
         )
+        failure["preflight"] = preflight
+        return failure
     if unverified:
-        return archive_failure(
+        failure = archive_failure(
             result="unproven",
             mechanical=[],
             unverified=unverified,
             human_required=human_required,
             mapping=normalized_mapping,
+            references=reference_summary,
+            runtime=runtime,
             recovery="Provide the missing approval or reference dispositions; no file was moved.",
         )
+        failure["preflight"] = preflight
+        return failure
     if source_path is None or target_path is None or destination is None:
         return archive_failure(
             result="fail",
@@ -2587,15 +2934,205 @@ def execute_controlled_archive(
             unverified=[],
             human_required=[],
             mapping=normalized_mapping,
+            references=reference_summary,
+            runtime=runtime,
             recovery="Rerun preflight with fully resolved paths; no file was moved.",
         )
 
+    amendment_digest = None
+    if amendment is not None:
+        if not isinstance(original_execution_grant, dict):
+            failure = archive_failure(
+                result="unproven",
+                mechanical=[],
+                unverified=["archive-amendment-original-grant-required"],
+                human_required=human_required,
+                mapping=normalized_mapping,
+                references=reference_summary,
+                runtime=runtime,
+                recovery=(
+                    "Provide the immutable original execution grant named by "
+                    "the amendment; no file was moved."
+                ),
+            )
+            failure["preflight"] = preflight
+            return failure
+        original_mapping = amendment.get("original_mapping")
+        corrected_mapping = amendment.get("corrected_mapping")
+        original_grant_operation = original_execution_grant.get("operation")
+        if (
+            corrected_mapping != normalized_mapping
+            or not isinstance(original_mapping, dict)
+            or not isinstance(original_grant_operation, dict)
+            or {
+                "source": original_grant_operation.get("source"),
+                "target": original_grant_operation.get("target"),
+            } != original_mapping
+        ):
+            failure = archive_failure(
+                result="fail",
+                mechanical=[{
+                    "code": "archive-amendment-operation-binding-mismatch",
+                }],
+                unverified=[],
+                human_required=human_required,
+                mapping=normalized_mapping,
+                references=reference_summary,
+                runtime=runtime,
+                recovery=(
+                    "Bind the original grant, original mapping, and corrected "
+                    "request exactly; no file was moved."
+                ),
+            )
+            failure["preflight"] = preflight
+            return failure
+        original_operation = {
+            "mapping": original_mapping,
+            "authority_disposition_sha256": operation[
+                "authority_disposition_sha256"
+            ],
+            "archive_root_sha256": original_grant_operation.get(
+                "archive_root_sha256"
+            ),
+            "corrected_archive_root_sha256": operation.get(
+                "archive_root_sha256"
+            ),
+            "archive_visibility": "excluded",
+            "archive_root_class": "configured-archive-root",
+            "recovery_boundary": "copy-to-unoccupied-active-path",
+            "approval_type": approval_type,
+        }
+        amendment_normalized, amendment_findings, amendment_unverified = (
+            validate_mapping_amendment(
+                adapter,
+                amendment,
+                original_operation=original_operation,
+                original_grant_digest=archive_protocol_digest(
+                    original_execution_grant
+                ),
+            )
+        )
+        if amendment_findings or amendment_unverified:
+            failure = archive_failure(
+                result="fail" if amendment_findings else "unproven",
+                mechanical=amendment_findings,
+                unverified=amendment_unverified,
+                human_required=human_required,
+                mapping=normalized_mapping,
+                references=reference_summary,
+                runtime=runtime,
+                recovery=(
+                    "Provide a separately bound mechanical amendment or obtain "
+                    "new explicit approval; no file was moved."
+                ),
+            )
+            failure["preflight"] = preflight
+            return failure
+        supplemental = amendment_normalized["supplemental_evidence"]
+        supplemental_path, supplemental_finding = archive_path(
+            workspace,
+            supplemental["path"],
+            "amendment.supplemental_evidence.path",
+        )
+        supplemental_ordinary = any(
+            path_matches(supplemental["path"], pattern)
+            for pattern in boundaries.get("ordinary_docs", [])
+        )
+        supplemental_forbidden = any(
+            path_matches(supplemental["path"], pattern)
+            for pattern in [
+                *boundaries.get("excluded", []),
+                *boundaries.get("protected", []),
+                *entrypoints.get("historical", []),
+            ]
+        )
+        evidence_valid = (
+            supplemental_finding is None
+            and supplemental_path is not None
+            and supplemental_path.is_file()
+            and not supplemental_path.is_symlink()
+            and supplemental_ordinary
+            and not supplemental_forbidden
+        )
+        if evidence_valid:
+            try:
+                supplemental_text = supplemental_path.read_text(
+                    encoding="utf-8"
+                )
+            except (OSError, UnicodeDecodeError):
+                evidence_valid = False
+            else:
+                evidence_valid = (
+                    file_digest(supplemental_path) == supplemental["sha256"]
+                    and not generated_non_authority_evidence(supplemental_text)
+                    and text_records_archive_amendment(
+                        supplemental_text,
+                        supplemental["type"],
+                        amendment_normalized["original_mapping"],
+                        amendment_normalized["corrected_mapping"],
+                        amendment_normalized["reason"],
+                    )
+                )
+        if not evidence_valid:
+            failure = archive_failure(
+                result="unproven",
+                mechanical=(
+                    [supplemental_finding]
+                    if supplemental_finding is not None
+                    else []
+                ),
+                unverified=[
+                    "archive-amendment-supplemental-evidence-invalid"
+                ],
+                human_required=[supplemental["type"]],
+                mapping=normalized_mapping,
+                references=reference_summary,
+                runtime=runtime,
+                recovery=(
+                    "Provide active ordinary supplemental evidence bound to "
+                    "both mappings and the correction reason; no file was moved."
+                ),
+            )
+            failure["preflight"] = preflight
+            return failure
+        amendment_digest = archive_protocol_digest(amendment_normalized)
+        preflight["amendment_sha256"] = amendment_digest
+        preflight["preflight_sha256"] = archive_protocol_digest({
+            "base_preflight_sha256": preflight["preflight_sha256"],
+            "amendment_sha256": amendment_digest,
+        })
+
+    if read_only:
+        return preflight
+
+    normalized_grant, grant_findings, grant_unverified = (
+        validate_execution_grant(
+            execution_grant,
+            request_digest=preflight["request_sha256"],
+            preflight_digest=preflight["preflight_sha256"],
+            operation=operation,
+            approval_digest=approval_digest,
+            amendment_digest=amendment_digest,
+        )
+    )
+    if grant_findings or grant_unverified:
+        failure = archive_failure(
+            result="fail" if grant_findings else "unproven",
+            mechanical=grant_findings,
+            unverified=grant_unverified,
+            human_required=human_required,
+            mapping=normalized_mapping,
+            references=reference_summary,
+            runtime=runtime,
+            recovery=(
+                "Provide an exact execution grant bound to this preflight, "
+                "mapping, receipt, disposition, and approval; no file was moved."
+            ),
+        )
+        failure["preflight"] = preflight
+        return failure
+
     before_digest = file_digest(source_path)
-    normalized_disposition = {
-        "kind": disposition_kind,
-        "replacement": normalized_replacement,
-        "statement": disposition_statement.strip(),
-    }
     receipt = {
         "schema": ARCHIVE_RECEIPT_SCHEMA,
         "schema_version": "1",
@@ -2621,12 +3158,19 @@ def execute_controlled_archive(
         "content": {
             "before_sha256": before_digest,
             "after_sha256": None,
+            "source_size": source_size,
             "unchanged": False,
         },
         "references": reference_summary,
         "execution": {
             "result": "pass",
             "operation": "single-file active-to-immutable-archive move",
+            "authorization": {
+                "grant_schema": EXECUTION_GRANT_SCHEMA,
+                "grant_sha256": archive_protocol_digest(normalized_grant),
+                "preflight_sha256": preflight["preflight_sha256"],
+                "amendment_sha256": amendment_digest,
+            },
         },
         "recovery": {
             "instructions": (
@@ -2879,7 +3423,7 @@ def execute_controlled_archive(
             if descriptor is not None:
                 os.close(descriptor)
 
-    return {
+    result = {
         "result": "pass",
         "mechanical_findings": [],
         "semantic_findings": [],
@@ -2892,13 +3436,51 @@ def execute_controlled_archive(
         "archive_receipt": receipt,
         "receipt_output": str(destination),
         "recovery": receipt["recovery"]["instructions"],
+        "preflight": preflight,
     }
+    result["normalized_result"] = normalize_archive_result(result)
+    return result
+
+
+def preflight_controlled_archive(
+    adapter: dict,
+    workspace: Path,
+    request: dict,
+    receipt_destination: Path,
+) -> dict:
+    return execute_controlled_archive(
+        adapter,
+        workspace,
+        request,
+        receipt_destination,
+        read_only=True,
+    )
 
 
 def controlled_archive_command(args: argparse.Namespace) -> None:
-    adapter, missing = load_json_or_missing(Path(args.adapter))
+    try:
+        adapter, missing = load_json_or_missing(Path(args.adapter))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        emit(structured_archive_exception(
+            exc,
+            phase="adapter-input",
+            mapping=None,
+        ))
+        return
     if missing:
         emit(missing)
+        return
+    if not isinstance(adapter, dict):
+        emit(archive_failure(
+            result="fail",
+            mechanical=[{
+                "code": "invalid-adapter",
+                "field": "root",
+            }],
+            unverified=[],
+            human_required=[],
+            recovery="Provide one adapter JSON object; no file was moved.",
+        ))
         return
     adapter_result = validate_adapter(adapter)
     if adapter_result["result"] != "pass":
@@ -2916,7 +3498,7 @@ def controlled_archive_command(args: argparse.Namespace) -> None:
         return
     try:
         request = json.loads(Path(args.request).read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
         emit({
             "result": "fail",
             "mechanical_findings": [{
@@ -2949,12 +3531,791 @@ def controlled_archive_command(args: argparse.Namespace) -> None:
             "recovery": "Provide one controlled archive request object.",
         })
         return
-    emit(execute_controlled_archive(
+    execution_grant = None
+    amendment = None
+    original_execution_grant = None
+    for field, attribute in (
+        ("execution_grant", "execution_grant"),
+        ("amendment", "amendment"),
+        ("original_execution_grant", "original_execution_grant"),
+    ):
+        raw_path = getattr(args, attribute, None)
+        if raw_path is None:
+            continue
+        try:
+            loaded = json.loads(Path(raw_path).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+            payload = archive_failure(
+                result="fail",
+                mechanical=[{
+                    "code": f"invalid-archive-{field.replace('_', '-')}-file",
+                    "path": str(raw_path),
+                    "message": str(exc),
+                }],
+                unverified=[],
+                human_required=[],
+                recovery=(
+                    "Provide one valid immutable archive authorization input; "
+                    "no file was moved."
+                ),
+            )
+            payload["normalized_result"] = normalize_archive_result(payload)
+            emit(payload)
+            return
+        if not isinstance(loaded, dict):
+            payload = archive_failure(
+                result="fail",
+                mechanical=[{
+                    "code": f"invalid-archive-{field.replace('_', '-')}",
+                    "field": "root",
+                }],
+                unverified=[],
+                human_required=[],
+                recovery=(
+                    "Provide one JSON object for the archive authorization "
+                    "input; no file was moved."
+                ),
+            )
+            payload["normalized_result"] = normalize_archive_result(payload)
+            emit(payload)
+            return
+        if field == "execution_grant":
+            execution_grant = loaded
+        elif field == "amendment":
+            amendment = loaded
+        else:
+            original_execution_grant = loaded
+    try:
+        payload = execute_controlled_archive(
+            adapter,
+            Path(args.workspace),
+            request,
+            Path(args.write_receipt),
+            execution_grant=execution_grant,
+            amendment=amendment,
+            original_execution_grant=original_execution_grant,
+            read_only=bool(getattr(args, "preflight", False)),
+        )
+    except BaseException as exc:
+        payload = structured_archive_exception(
+            exc,
+            phase="execution",
+            mapping=(
+                request.get("mapping")
+                if isinstance(request.get("mapping"), dict)
+                else None
+            ),
+            state_changes={
+                "source_moved": False,
+                "target_created": False,
+                "receipt_created": False,
+                "temporary_artifacts": [],
+                "recovery_attempted": True,
+                "state_requires_inspection": True,
+            },
+        )
+    if "normalized_result" not in payload:
+        payload["normalized_result"] = normalize_archive_result(payload)
+    emit(payload)
+
+
+def _archive_task_preflight_payload(
+    adapter: dict,
+    workspace: Path,
+    manifest: dict,
+    *,
+    completed_receipts: dict[str, dict] | None = None,
+    summary_destination: str | None = None,
+    previous_summary: str | None = None,
+) -> tuple[dict, list[dict]]:
+    normalized, manifest_findings = validate_archive_task_manifest(manifest)
+    if normalized is None:
+        payload = {
+            "schema": "govern-ai-coding.archive-task-preflight.v1",
+            "schema_version": "1",
+            "result": "fail",
+            "phase": "task-preflight",
+            "analysis_only": True,
+            "execution_approved": False,
+            "files_moved": [],
+            "atomicity": "none-read-only",
+            "task_atomicity": "non-atomic-independent-operations",
+            "operation_preflights": [],
+            "mechanical_findings": manifest_findings,
+            "recovery": (
+                "Correct the task manifest; no file was moved and this result "
+                "is not execution approval."
+            ),
+        }
+        payload["normalized_result"] = normalize_archive_result(payload)
+        return payload, []
+
+    completed_receipts = completed_receipts or {}
+    operation_preflights: list[dict] = []
+    runtime_operations: list[dict] = []
+    for operation in normalized["operations"]:
+        request = operation["request"]
+        mapping = request.get("mapping", {})
+        runtime_operations.append({
+            "source": mapping.get("source"),
+            "target": mapping.get("target"),
+            "receipt": operation["receipt"],
+        })
+        if operation["id"] in completed_receipts:
+            receipt = completed_receipts[operation["id"]]
+            operation_preflights.append({
+                "result": "pass",
+                "phase": "receipt-reconciliation",
+                "task_operation_id": operation["id"],
+                "request_sha256": archive_protocol_digest(request),
+                "mapping": mapping,
+                "preflight_sha256": (
+                    receipt.get("execution", {})
+                    .get("authorization", {})
+                    .get("preflight_sha256")
+                ),
+                "operation": {
+                    "source": mapping.get("source"),
+                    "target": mapping.get("target"),
+                    "receipt": operation["receipt"],
+                    "source_sha256": (
+                        receipt.get("content", {}).get("before_sha256")
+                    ),
+                    "source_size": (
+                        receipt.get("content", {}).get("source_size")
+                    ),
+                },
+                "completed_receipt_verified": True,
+            })
+            continue
+        operation_preflight = execute_controlled_archive(
+            adapter,
+            workspace,
+            request,
+            workspace / operation["receipt"],
+            amendment=operation.get("amendment"),
+            original_execution_grant=operation.get(
+                "original_execution_grant"
+            ),
+            read_only=True,
+        )
+        operation_preflight["task_operation_id"] = operation["id"]
+        operation_preflights.append(operation_preflight)
+    runtime = runtime_capability_report(
+        workspace,
+        runtime_operations,
+        read_only=True,
+    )
+    payload = global_archive_preflight(
+        normalized,
+        operation_preflights,
+        runtime,
+    )
+    output_findings: list[dict] = []
+    output_binding = {
+        "summary_destination": summary_destination,
+        "previous_summary": previous_summary,
+        "previous_summary_sha256": None,
+    }
+    resolved_summary = None
+    if previous_summary is not None and summary_destination is None:
+        output_findings.append({
+            "code": "archive-task-summary-predecessor-without-output",
+        })
+    if summary_destination is not None:
+        resolved_summary, summary_findings = resolve_receipt_output_path(
+            summary_destination,
+            workspace,
+            adapter,
+        )
+        output_findings.extend(summary_findings)
+        if resolved_summary is not None:
+            if resolved_summary.exists() or resolved_summary.is_symlink():
+                output_findings.append({
+                    "code": "archive-task-summary-exists",
+                    "path": str(resolved_summary),
+                })
+            if not resolved_summary.parent.is_dir():
+                output_findings.append({
+                    "code": "archive-task-summary-parent-missing",
+                    "path": str(resolved_summary.parent),
+                })
+            summary_value = (
+                resolved_summary.relative_to(workspace).as_posix()
+                if resolved_summary.is_relative_to(workspace)
+                else str(resolved_summary)
+            )
+            for operation in normalized["operations"]:
+                mapping = operation["request"].get("mapping", {})
+                for role, value in (
+                    ("source", mapping.get("source")),
+                    ("target", mapping.get("target")),
+                    ("receipt", operation.get("receipt")),
+                ):
+                    if (
+                        isinstance(value, str)
+                        and unicodedata.normalize("NFC", value).casefold()
+                        == unicodedata.normalize(
+                            "NFC",
+                            summary_value,
+                        ).casefold()
+                    ):
+                        output_findings.append({
+                            "code": "archive-task-summary-path-alias",
+                            "operation": operation["id"],
+                            "role": role,
+                            "path": summary_value,
+                        })
+    if previous_summary is not None:
+        previous_path, previous_findings = resolve_receipt_output_path(
+            previous_summary,
+            workspace,
+            adapter,
+        )
+        output_findings.extend(previous_findings)
+        if (
+            previous_path is None
+            or not previous_path.is_file()
+            or previous_path.is_symlink()
+        ):
+            output_findings.append({
+                "code": "archive-task-summary-predecessor-unavailable",
+                "path": previous_summary,
+            })
+        else:
+            try:
+                output_binding["previous_summary_sha256"] = file_digest(
+                    previous_path
+                )
+            except OSError as exc:
+                output_findings.append({
+                    "code": "archive-task-summary-predecessor-unreadable",
+                    "path": previous_summary,
+                    "message": str(exc),
+                })
+    output_binding["resolved_summary_destination"] = (
+        str(resolved_summary) if resolved_summary is not None else None
+    )
+    payload["task_summary_binding"] = output_binding
+    payload["mechanical_findings"].extend(output_findings)
+    if output_findings:
+        payload["result"] = "fail"
+    payload["preflight_sha256"] = archive_protocol_digest({
+        "base_preflight_sha256": payload["preflight_sha256"],
+        "task_summary_binding": output_binding,
+        "output_findings": output_findings,
+    })
+    payload["normalized_result"] = normalize_archive_result(payload)
+    return payload, operation_preflights
+
+
+def _load_archive_task_receipts(
+    workspace: Path,
+    manifest: dict,
+) -> tuple[dict[str, dict], list[dict]]:
+    receipts: dict[str, dict] = {}
+    findings: list[dict] = []
+    operations = manifest.get("operations", [])
+    if not isinstance(operations, list):
+        return receipts, findings
+    for operation in operations:
+        if not isinstance(operation, dict):
+            continue
+        identifier = operation.get("id")
+        receipt = operation.get("receipt")
+        if not isinstance(identifier, str) or not isinstance(receipt, str):
+            continue
+        path = workspace / receipt
+        if not path.exists():
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            findings.append({
+                "code": "archive-task-receipt-unreadable",
+                "operation": identifier,
+                "path": receipt,
+                "message": str(exc),
+            })
+            continue
+        if not isinstance(payload, dict):
+            findings.append({
+                "code": "archive-task-receipt-invalid",
+                "operation": identifier,
+                "path": receipt,
+            })
+            continue
+        receipts[identifier] = payload
+    return receipts, findings
+
+
+def archive_task_command(args: argparse.Namespace) -> None:
+    try:
+        adapter, missing = load_json_or_missing(Path(args.adapter))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        emit(structured_archive_exception(
+            exc,
+            phase="task-adapter-input",
+            mapping=None,
+        ))
+        return
+    if missing:
+        emit(missing)
+        return
+    if not isinstance(adapter, dict):
+        emit({
+            "result": "fail",
+            "phase": "task-adapter-preflight",
+            "mechanical_findings": [{
+                "code": "invalid-adapter",
+                "field": "root",
+            }],
+            "files_moved": [],
+            "atomicity": "none-read-only",
+            "recovery": "Provide one adapter JSON object; no file was moved.",
+        })
+        return
+    adapter_result = validate_adapter(adapter)
+    if adapter_result["result"] != "pass":
+        emit({
+            "result": "fail",
+            "phase": "task-adapter-preflight",
+            "mechanical_findings": adapter_result["mechanical_findings"],
+            "files_moved": [],
+            "atomicity": "none-read-only",
+            "recovery": (
+                "Fix adapter findings before archive task analysis or "
+                "execution; no file was moved."
+            ),
+        })
+        return
+    workspace = Path(args.workspace).resolve()
+    try:
+        manifest = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        emit({
+            "result": "fail",
+            "phase": "task-preflight",
+            "mechanical_findings": [{
+                "code": "invalid-archive-task-file",
+                "path": str(args.manifest),
+                "message": str(exc),
+            }],
+            "files_moved": [],
+            "atomicity": "none-read-only",
+            "recovery": "Provide one valid archive task manifest; no file was moved.",
+        })
+        return
+    if not isinstance(manifest, dict):
+        emit({
+            "result": "fail",
+            "phase": "task-preflight",
+            "mechanical_findings": [{
+                "code": "invalid-archive-task",
+                "field": "root",
+            }],
+            "files_moved": [],
+            "atomicity": "none-read-only",
+            "recovery": "Provide one archive task object; no file was moved.",
+        })
+        return
+
+    receipts, receipt_findings = _load_archive_task_receipts(
+        workspace,
+        manifest,
+    )
+    provisional_summary = reconcile_archive_task(
+        manifest,
+        [],
+        receipts,
+        workspace=workspace,
+    )
+    completed_ids = {
+        item["id"]
+        for item in provisional_summary.get("operations", [])
+        if item.get("state") == "completed-receipt-verified"
+    }
+    completed_receipts = {
+        identifier: payload
+        for identifier, payload in receipts.items()
+        if identifier in completed_ids
+    }
+    if args.archive_task_action == "status":
+        preflight, operation_preflights = _archive_task_preflight_payload(
+            adapter,
+            workspace,
+            manifest,
+            completed_receipts=completed_receipts,
+            summary_destination=getattr(args, "write_summary", None),
+            previous_summary=getattr(args, "previous_summary", None),
+        )
+        summary = reconcile_archive_task(
+            manifest,
+            operation_preflights,
+            receipts,
+            workspace=workspace,
+        )
+        summary["mechanical_findings"].extend(receipt_findings)
+        if receipt_findings:
+            summary["result"] = "fail"
+        summary["preflight"] = preflight
+        summary["normalized_result"] = normalize_archive_result(summary)
+        emit(summary)
+        return
+
+    preflight, operation_preflights = _archive_task_preflight_payload(
         adapter,
-        Path(args.workspace),
-        request,
-        Path(args.write_receipt),
-    ))
+        workspace,
+        manifest,
+        completed_receipts=completed_receipts,
+        summary_destination=getattr(args, "write_summary", None),
+        previous_summary=getattr(args, "previous_summary", None),
+    )
+    if args.archive_task_action == "preflight":
+        if receipt_findings:
+            preflight["mechanical_findings"].extend(receipt_findings)
+            preflight["result"] = "fail"
+            preflight["normalized_result"] = normalize_archive_result(preflight)
+        emit(preflight)
+        return
+
+    if preflight["result"] != "pass":
+        emit(preflight)
+        return
+    try:
+        grant = json.loads(Path(args.execution_grant).read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        emit({
+            "result": "fail",
+            "phase": "task-execution",
+            "mechanical_findings": [{
+                "code": "invalid-archive-task-execution-grant-file",
+                "path": str(args.execution_grant),
+                "message": str(exc),
+            }],
+            "files_moved": [],
+            "atomicity": "non-atomic-independent-operations",
+            "recovery": "Provide the exact task execution grant; no pending file was moved.",
+        })
+        return
+    operation_ids = [
+        item.get("id")
+        for item in manifest.get("operations", [])
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    ]
+    _, grant_findings, grant_unverified = validate_task_execution_grant(
+        grant if isinstance(grant, dict) else None,
+        manifest_digest=preflight["manifest_sha256"],
+        preflight_digest=preflight["preflight_sha256"],
+        operation_ids=operation_ids,
+    )
+    if completed_ids:
+        grant_findings = [
+            finding for finding in grant_findings
+            if not (
+                finding.get("code") == "archive-task-grant-binding-mismatch"
+                and finding.get("field") == "preflight_sha256"
+            )
+        ]
+        operation_grants = (
+            grant.get("operation_grants", {})
+            if isinstance(grant, dict)
+            else {}
+        )
+        for operation in manifest.get("operations", []):
+            identifier = operation.get("id")
+            if identifier not in completed_ids:
+                continue
+            receipt = receipts.get(identifier)
+            original = operation_grants.get(identifier)
+            receipt_grant_findings = validate_receipt_grant_binding(
+                receipt if isinstance(receipt, dict) else {},
+                original if isinstance(original, dict) else {},
+            )
+            for finding in receipt_grant_findings:
+                finding["operation"] = identifier
+            grant_findings.extend(receipt_grant_findings)
+        for operation, current in zip(
+            manifest.get("operations", []),
+            operation_preflights,
+        ):
+            if operation.get("id") in completed_ids:
+                continue
+            original = operation_grants.get(operation.get("id"))
+            for field in ("request_sha256", "approval_sha256", "operation"):
+                if (
+                    not isinstance(original, dict)
+                    or original.get(field) != current.get(field)
+                ):
+                    grant_findings.append({
+                        "code": "archive-task-resume-binding-mismatch",
+                        "operation": operation.get("id"),
+                        "field": field,
+                    })
+    if grant_findings or grant_unverified:
+        emit({
+            "result": "fail" if grant_findings else "unproven",
+            "phase": "task-execution",
+            "mechanical_findings": grant_findings,
+            "coverage": {"unverified": grant_unverified},
+            "files_moved": [],
+            "atomicity": "non-atomic-independent-operations",
+            "recovery": (
+                "Provide a task grant bound to this exact manifest, global "
+                "preflight, and complete operation set."
+            ),
+        })
+        return
+
+    summary_destination = None
+    if args.write_summary:
+        summary_destination, summary_findings = resolve_receipt_output_path(
+            args.write_summary,
+            workspace,
+            adapter,
+        )
+        if (
+            summary_destination is not None
+            and (
+                summary_destination.exists()
+                or summary_destination.is_symlink()
+            )
+        ):
+            summary_findings.append({
+                "code": "archive-task-summary-exists",
+                "path": str(summary_destination),
+            })
+        if summary_destination is not None and not summary_destination.parent.is_dir():
+            summary_findings.append({
+                "code": "archive-task-summary-parent-missing",
+                "path": str(summary_destination.parent),
+            })
+        if summary_findings or summary_destination is None:
+            emit({
+                "result": "fail",
+                "phase": "task-execution-preflight",
+                "mechanical_findings": summary_findings,
+                "files_moved": [],
+                "atomicity": "none-read-only",
+                "task_atomicity": "non-atomic-independent-operations",
+                "recovery": (
+                    "Choose one unused persistent task-summary destination; "
+                    "no file was moved."
+                ),
+            })
+            return
+
+    operation_grants = grant["operation_grants"]
+    results: list[dict] = []
+    for operation in manifest["operations"]:
+        identifier = operation["id"]
+        if identifier in completed_ids:
+            results.append({
+                "id": identifier,
+                "state": "completed-receipt-verified",
+                "skipped": True,
+            })
+            continue
+        original_operation_grant = operation_grants.get(identifier)
+        current_preflight = execute_controlled_archive(
+            adapter,
+            workspace,
+            operation["request"],
+            workspace / operation["receipt"],
+            amendment=operation.get("amendment"),
+            original_execution_grant=operation.get(
+                "original_execution_grant"
+            ),
+            read_only=True,
+        )
+        refreshed_operation_grant = original_operation_grant
+        if (
+            current_preflight.get("result") == "pass"
+            and isinstance(original_operation_grant, dict)
+            and original_operation_grant.get("request_sha256")
+            == current_preflight.get("request_sha256")
+            and original_operation_grant.get("approval_sha256")
+            == current_preflight.get("approval_sha256")
+            and original_operation_grant.get("operation")
+            == current_preflight.get("operation")
+        ):
+            refreshed_operation_grant = json.loads(
+                json.dumps(original_operation_grant)
+            )
+            refreshed_operation_grant["preflight_sha256"] = (
+                current_preflight["preflight_sha256"]
+            )
+        try:
+            result = execute_controlled_archive(
+                adapter,
+                workspace,
+                operation["request"],
+                workspace / operation["receipt"],
+                execution_grant=refreshed_operation_grant,
+                amendment=operation.get("amendment"),
+                original_execution_grant=operation.get(
+                    "original_execution_grant"
+                ),
+            )
+        except BaseException as exc:
+            result = structured_archive_exception(
+                exc,
+                phase="task-operation-execution",
+                mapping=operation["request"].get("mapping"),
+                state_changes={
+                    "source_moved": False,
+                    "target_created": False,
+                    "receipt_created": False,
+                    "temporary_artifacts": [],
+                    "recovery_attempted": True,
+                    "state_requires_inspection": True,
+                },
+            )
+        state_changes = result.get("controlled_archive", {}).get(
+            "state_changes",
+            {},
+        )
+        outcome_requires_inspection = (
+            isinstance(state_changes, dict)
+            and state_changes.get("state_requires_inspection") is True
+        )
+        results.append({
+            "id": identifier,
+            "state": (
+                "completed-receipt-verified"
+                if result.get("result") == "pass"
+                else "execution-outcome-unknown"
+                if outcome_requires_inspection
+                else "execution-failed"
+            ),
+            "skipped": False,
+            "result": result,
+        })
+        if result.get("result") != "pass":
+            break
+
+    refreshed_receipts, refreshed_findings = _load_archive_task_receipts(
+        workspace,
+        manifest,
+    )
+    summary = reconcile_archive_task(
+        manifest,
+        operation_preflights,
+        refreshed_receipts,
+        workspace=workspace,
+    )
+    summary["execution_results"] = results
+    execution_states = {
+        item["id"]: item["state"]
+        for item in results
+        if isinstance(item, dict)
+    }
+    for item in summary["operations"]:
+        execution_state = execution_states.get(item["id"])
+        if execution_state == "execution-failed":
+            item["state"] = "execution-failed"
+            item["authorization_state"] = "exact-grant-bound"
+            item["resumable"] = True
+        elif execution_state == "execution-outcome-unknown":
+            item["state"] = "execution-outcome-unknown"
+            item["authorization_state"] = "outcome-reconciliation-required"
+            item["resumable"] = False
+            item["recovery_actions"] = [
+                (
+                    "Run archive-task status as a read-only reconciliation; "
+                    "retry only after it proves this operation did not complete."
+                )
+            ]
+    summary["mechanical_findings"].extend(refreshed_findings)
+    unknown_outcome = any(
+        item.get("state") == "execution-outcome-unknown"
+        for item in summary["operations"]
+    )
+    summary["result"] = (
+        "unproven"
+        if unknown_outcome
+        else "pass"
+        if all(
+            item.get("state") == "completed-receipt-verified"
+            for item in summary["operations"]
+        )
+        else "fail"
+    )
+    if unknown_outcome:
+        summary["recovery"] = (
+            "Run archive-task status as a read-only reconciliation. Retry only "
+            "if it proves the source remains unchanged and the target and "
+            "receipt were not created; otherwise preserve the observed state "
+            "and resolve its findings without re-execution."
+        )
+    summary["authorization_state"] = "exact-task-grant-bound"
+    summary["global_preflight_sha256"] = preflight["preflight_sha256"]
+    summary["task_grant_sha256"] = archive_protocol_digest(grant)
+    summary["previous_summary_sha256"] = preflight.get(
+        "task_summary_binding",
+        {},
+    ).get("previous_summary_sha256")
+    summary["receipt_bindings"] = []
+    for operation in manifest["operations"]:
+        receipt_path = workspace / operation["receipt"]
+        if receipt_path.is_file() and not receipt_path.is_symlink():
+            summary["receipt_bindings"].append({
+                "operation": operation["id"],
+                "path": operation["receipt"],
+                "sha256": file_digest(receipt_path),
+            })
+    summary["normalized_result"] = normalize_archive_result(summary)
+    if summary_destination is not None:
+        try:
+            atomic_write_json(summary, summary_destination, overwrite=False)
+            summary["summary_output"] = str(summary_destination)
+        except (OSError, TypeError, ValueError) as exc:
+            summary["mechanical_findings"].append({
+                "code": "archive-task-summary-write-failed",
+                "path": str(summary_destination),
+                "message": str(exc),
+            })
+            summary["result"] = "fail"
+    summary["normalized_result"] = normalize_archive_result(summary)
+    emit(summary)
+
+
+def archive_authorization_status_command(args: argparse.Namespace) -> None:
+    adapter, missing = load_json_or_missing(Path(args.adapter))
+    if missing:
+        emit(missing)
+        return
+    payload = archive_authorization_lifecycle(
+        adapter,
+        Path(args.workspace).resolve(),
+        authorization_id=args.authorization_id,
+    )
+    payload["normalized_result"] = normalize_archive_result(payload)
+    emit(payload)
+
+
+def normalize_archive_result_command(args: argparse.Namespace) -> None:
+    try:
+        payload = json.loads(Path(args.input).read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        emit({
+            "schema": "govern-ai-coding.normalized-result.v1",
+            "schema_version": "1",
+            "verdict": "unproven",
+            "phase": "parsing",
+            "operation_state": "unreadable",
+            "changed": False,
+            "atomicity": "unknown",
+            "authorization_state": "unknown",
+            "receipt_bindings": [],
+            "diagnostics": [{
+                "code": "result-input-unreadable",
+                "message": str(exc),
+            }],
+            "recovery": "Provide one readable JSON result or receipt.",
+        })
+        return
+    emit(normalize_archive_result(payload))
 
 
 def freeze_command(args: argparse.Namespace) -> None:
@@ -3898,6 +5259,47 @@ def text_records_archive_approval(
     return True
 
 
+def text_records_archive_amendment(
+    text: str,
+    approval_type: str,
+    original_mapping: dict,
+    corrected_mapping: dict,
+    reason: str,
+) -> bool:
+    fields: dict[str, str] = {}
+    for line in text.splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        fields[key.strip().lower()] = value.strip()
+    required = {
+        "approval type",
+        "original object",
+        "corrected object",
+        "reason",
+        "does not approve",
+    }
+    if not required.issubset(fields) or any(not fields[key] for key in required):
+        return False
+    if fields["approval type"].rstrip(". ").casefold() != approval_type.rstrip(
+        ". "
+    ).casefold():
+        return False
+    for field, mapping in (
+        ("original object", original_mapping),
+        ("corrected object", corrected_mapping),
+    ):
+        for path in (mapping.get("source"), mapping.get("target")):
+            if not isinstance(path, str) or not re.search(
+                rf"(?<![A-Za-z0-9_./-]){re.escape(path)}(?![A-Za-z0-9_./-])",
+                fields[field],
+            ):
+                return False
+    return fields["reason"].rstrip(". ").casefold() == reason.rstrip(
+        ". "
+    ).casefold()
+
+
 def generated_non_authority_evidence(text: str) -> bool:
     try:
         payload = json.loads(text)
@@ -4752,6 +6154,11 @@ def make_diagnostic(
 def add_structured_diagnostics(payload: dict) -> dict:
     if not isinstance(payload, dict):
         return payload
+    if (
+        payload.get("schema") == "govern-ai-coding.normalized-result.v1"
+        and isinstance(payload.get("diagnostics"), list)
+    ):
+        return payload
     diagnostics: list[dict] = []
     for finding in payload.get("mechanical_findings", []) or []:
         if not isinstance(finding, dict):
@@ -5245,7 +6652,42 @@ def build_parser() -> argparse.ArgumentParser:
     controlled_archive.add_argument("--workspace", required=True)
     controlled_archive.add_argument("--request", required=True)
     controlled_archive.add_argument("--write-receipt", required=True)
+    controlled_archive.add_argument("--preflight", action="store_true")
+    controlled_archive.add_argument("--execution-grant")
+    controlled_archive.add_argument("--amendment")
+    controlled_archive.add_argument("--original-execution-grant")
     controlled_archive.set_defaults(func=controlled_archive_command)
+
+    archive_task = sub.add_parser("archive-task")
+    archive_task_sub = archive_task.add_subparsers(
+        required=True,
+        dest="archive_task_action",
+    )
+    for action in ("preflight", "status", "execute"):
+        action_parser = archive_task_sub.add_parser(action)
+        action_parser.add_argument("adapter")
+        action_parser.add_argument("--workspace", required=True)
+        action_parser.add_argument("--manifest", required=True)
+        if action in {"preflight", "status", "execute"}:
+            action_parser.add_argument("--write-summary")
+            action_parser.add_argument("--previous-summary")
+        if action == "execute":
+            action_parser.add_argument("--execution-grant", required=True)
+        action_parser.set_defaults(func=archive_task_command)
+
+    archive_authorization_status = sub.add_parser(
+        "archive-authorization-status"
+    )
+    archive_authorization_status.add_argument("adapter")
+    archive_authorization_status.add_argument("--workspace", required=True)
+    archive_authorization_status.add_argument("--authorization-id")
+    archive_authorization_status.set_defaults(
+        func=archive_authorization_status_command
+    )
+
+    normalize_archive = sub.add_parser("normalize-archive-result")
+    normalize_archive.add_argument("--input", required=True)
+    normalize_archive.set_defaults(func=normalize_archive_result_command)
 
     diagnose_parser = sub.add_parser("diagnose")
     diagnose_parser.add_argument("adapter")
