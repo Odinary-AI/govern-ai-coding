@@ -45,6 +45,12 @@ binds the baseline, final paths, semantic review, approvals, and freeze receipt.
 Any governed edit after freeze invalidates the proof: refreeze, rerun
 project-selected affected validation, and rerun Closeout.
 
+When Git supplies event isolation, keep Git HEAD at the Impact baseline until
+Closeout passes; working-tree and staged edits remain part of that event. In
+the usual case, one governed event maps to one post-Closeout commit. If another
+workflow requests intermediate commits, either defer them or close the current
+event and start a new Impact for the next commit-sized event.
+
 Do not write promises such as “Closeout will run later” into persistent project
 facts. Run the gate in the task that is closing. Impact, freeze, and Closeout
 receipts are generated, non-authoritative evidence; keep them outside governed
@@ -138,6 +144,8 @@ the sole project work-state authority. The `work-map` commands are read-only:
 
 ```bash
 python3 scripts/govern_ai_coding.py work-map check adapter.json --workspace /project
+python3 scripts/govern_ai_coding.py work-map status adapter.json --workspace /project \
+  --event-manifest /safe/generated/event.json
 python3 scripts/govern_ai_coding.py work-map start adapter.json --workspace /project \
   --item ITEM-01 --task-id 019fb5c7-3361-76b2-8908-40bc995f084b
 python3 scripts/govern_ai_coding.py work-map finish adapter.json --workspace /project \
@@ -151,13 +159,25 @@ python3 scripts/govern_ai_coding.py work-map render adapter.json --workspace /pr
 edit the source, allocate a task ID, assign work, or close an external task.
 The same active task is an idempotent pass/no-op; a different task is a
 conflict. Table and Mermaid renderers consume the same normalized source-table
-model, and generated views never become input.
+model, and generated views never become input. Table status vocabulary belongs
+to the adapter; the core maps a transition disposition only to its configured
+progress classification.
+The first configured value remains the canonical transition output; final
+verification accepts every value configured for that protocol disposition.
 
 An event manifest may bind `work_map_binding`. In that opt-in mode Closeout
 also reconciles Impact-planned and actual paths and requires a structured
-validation receipt bound to the exact Freeze. Historical
-`govern-project-docs` attestations may be classified as historical evidence
-only; they are not accepted as current protocol receipts.
+validation receipt bound to the exact Freeze. `work_map_binding.source_digest` is the full Work Map source-table digest captured at the event baseline,
+distinct from `final_table_digest` in the final observation. `work-map status` reads that
+binding, observes the current item, and compares it with the declared external
+attestation without changing either source. A pass is limited to that bounded
+current observation and a complete immutable attestation whose schema markers,
+adapter and event identities, final scope and content, receipt bindings, and
+manifest-recorded path and digest all match. Active bound work with no
+attestation is `unproven`, not failed. An attestation without `work_map_observation`
+remains readable but is `unproven` for current governance closure. Historical
+`govern-project-docs` attestations are evidence only and likewise cannot prove
+current closure.
 
 ## Controlled Archive Intake
 
@@ -266,6 +286,49 @@ validation missing, and semantic review. Each item carries `fields` or `paths`
 when applicable and a non-empty `recovery_actions` list. Follow the smallest recovery action;
 do not restart a valid Impact merely because Freeze or one evidence pointer is
 missing.
+
+## Integration Verification
+
+After integration, run the read-only verifier against the original immutable
+attestation and its source event context:
+
+```bash
+python3 scripts/govern_ai_coding.py verify-integration adapter.json \
+  --workspace /source/workspace \
+  --event-manifest /safe/generated/event.json \
+  --attestation /safe/generated/attestation.json \
+  --target-workspace /integrated/workspace \
+  --target-adapter adapter.json \
+  --target-ref refs/heads/target
+```
+
+Without `--target-ref`, content and the target adapter are read from the target
+workspace. With a ref, blobs are read from Git without checkout. Matching bytes
+and adapter identity do not prove rewritten history; unavailable ancestry stays
+`unproven`. A validation receipt may add `input_classes`; claims inherit only
+when every declared class is directly observed and matches. Unknown or
+unobservable classes stay `unproven`. The verifier never establishes branch,
+release, deployment, or product readiness and never merges or modifies files.
+
+## Declared Event Preflight
+
+Before parallel edits, compare only manifests that have already declared their
+scope:
+
+```bash
+python3 scripts/govern_ai_coding.py preflight-event adapter.json \
+  --workspace /current/workspace \
+  --event-manifest /safe/generated/current-event.json \
+  --peer-manifest /safe/generated/peer-event.json
+```
+
+Different tasks bound to one Work Map item, exact mutation-path overlap, an
+unfinished configured dependency, or trusted peer evidence that changed a
+declared baseline input fails. Authority-rule overlap warns and remains
+`unproven`; missing or invalid peer evidence cannot manufacture a conflict.
+The command inspects no sessions, tasks, processes, branches, or worktrees and
+does not schedule, lock, merge, or modify anything. Its result says nothing
+about concurrent work that was not supplied.
 
 ## Live Diagnostic
 

@@ -94,9 +94,12 @@ try:
     from work_map import (
         check_work_map,
         finish_work_item,
+        observe_work_map_final,
         render_work_map,
         start_work_item,
         validate_work_map_config,
+        verify_work_map_binding,
+        work_map_status,
     )
 except ModuleNotFoundError:
     _work_map_path = Path(__file__).with_name("work_map.py")
@@ -112,7 +115,67 @@ except ModuleNotFoundError:
     check_work_map = _work_map_module.check_work_map
     start_work_item = _work_map_module.start_work_item
     finish_work_item = _work_map_module.finish_work_item
+    observe_work_map_final = _work_map_module.observe_work_map_final
     render_work_map = _work_map_module.render_work_map
+    verify_work_map_binding = _work_map_module.verify_work_map_binding
+    work_map_status = _work_map_module.work_map_status
+
+try:
+    from integration_verification import verify_integration
+except ModuleNotFoundError:
+    _integration_path = Path(__file__).with_name("integration_verification.py")
+    _integration_spec = importlib.util.spec_from_file_location(
+        "govern_ai_coding_integration_verification", _integration_path,
+    )
+    if _integration_spec is None or _integration_spec.loader is None:
+        raise
+    _integration_module = importlib.util.module_from_spec(_integration_spec)
+    _integration_spec.loader.exec_module(_integration_module)
+    verify_integration = _integration_module.verify_integration
+
+try:
+    from event_preflight import preflight_declared_events
+except ModuleNotFoundError:
+    _event_preflight_path = Path(__file__).with_name("event_preflight.py")
+    _event_preflight_spec = importlib.util.spec_from_file_location(
+        "govern_ai_coding_event_preflight", _event_preflight_path,
+    )
+    if _event_preflight_spec is None or _event_preflight_spec.loader is None:
+        raise
+    _event_preflight_module = importlib.util.module_from_spec(
+        _event_preflight_spec
+    )
+    _event_preflight_spec.loader.exec_module(_event_preflight_module)
+    preflight_declared_events = (
+        _event_preflight_module.preflight_declared_events
+    )
+
+try:
+    from closeout_evidence import (
+        CLOSEOUT_ATTESTATION_SCHEMA,
+        build_closeout_attestation as build_evidence_attestation,
+        collect_validation_evidence,
+    )
+except ModuleNotFoundError:
+    _closeout_evidence_path = Path(__file__).with_name("closeout_evidence.py")
+    _closeout_evidence_spec = importlib.util.spec_from_file_location(
+        "govern_ai_coding_closeout_evidence", _closeout_evidence_path,
+    )
+    if _closeout_evidence_spec is None or _closeout_evidence_spec.loader is None:
+        raise
+    _closeout_evidence_module = importlib.util.module_from_spec(
+        _closeout_evidence_spec
+    )
+    _closeout_evidence_spec.loader.exec_module(_closeout_evidence_module)
+    CLOSEOUT_ATTESTATION_SCHEMA = (
+        _closeout_evidence_module.CLOSEOUT_ATTESTATION_SCHEMA
+    )
+    build_evidence_attestation = (
+        _closeout_evidence_module.build_closeout_attestation
+    )
+    collect_validation_evidence = (
+        _closeout_evidence_module.collect_validation_evidence
+    )
 
 
 CHANGE_KINDS = {"added", "modified", "deleted", "renamed"}
@@ -120,7 +183,6 @@ INVENTORY_SCHEMA = "govern-ai-coding.inventory.v1"
 IMPACT_RECEIPT_SCHEMA = "govern-ai-coding.receipt.v1"
 FREEZE_RECEIPT_SCHEMA = "govern-ai-coding.freeze-receipt.v1"
 EVENT_MANIFEST_SCHEMA = "govern-ai-coding.event-manifest.v1"
-CLOSEOUT_ATTESTATION_SCHEMA = "govern-ai-coding.closeout-attestation.v1"
 ARCHIVE_REQUEST_SCHEMA = "govern-ai-coding.archive-request.v1"
 ARCHIVE_RECEIPT_SCHEMA = "govern-ai-coding.archive-receipt.v1"
 ADAPTER_SCHEMA_VERSION = "2"
@@ -745,7 +807,62 @@ def work_map_command(args: argparse.Namespace) -> None:
         })
         return
     workspace = Path(args.workspace)
-    if args.work_map_action == "check":
+    if args.work_map_action == "status":
+        manifest, findings = load_event_manifest(args.event_manifest)
+        if manifest is not None:
+            declared_workspace = Path(manifest["event"]["workspace"])
+            if not declared_workspace.is_absolute():
+                declared_workspace = Path(args.event_manifest).parent / declared_workspace
+            if declared_workspace.resolve() != workspace.resolve():
+                findings.append({
+                    "code": "event-manifest-workspace-mismatch",
+                    "expected": str(workspace.resolve()),
+                    "actual": str(declared_workspace.resolve()),
+                })
+        if findings:
+            emit({
+                "result": "fail",
+                "mechanical_findings": findings,
+                "semantic_findings": [],
+                "human_approval_required": [],
+                "recovery": "Correct the event manifest before deriving Work Map status.",
+            })
+            return
+        binding = manifest.get("work_map_binding") if manifest is not None else None
+        if not isinstance(binding, dict):
+            emit({
+                "result": "unproven",
+                "mechanical_findings": [],
+                "semantic_findings": [],
+                "human_approval_required": [],
+                "recovery": "Bind the event manifest to a Work Map item before deriving status.",
+            })
+            return
+        try:
+            payload = work_map_status(adapter, workspace, binding, manifest)
+        except (OSError, UnicodeError) as exc:
+            payload = {
+                "result": "unproven",
+                "engineering_relation": "evidence-unreadable",
+                "attestation_relation": "unproven",
+                "observation": None,
+                "attestation": None,
+                "findings": [{
+                    "code": "work-map-evidence-unreadable",
+                    "message": str(exc),
+                    "recovery_actions": [
+                        "Restore readable Work Map evidence and rerun the read-only status command."
+                    ],
+                }],
+                "claim_boundary": {
+                    "proves": [],
+                    "does_not_prove": [
+                        "external task closure",
+                        "semantic truth of evidence",
+                    ],
+                },
+            }
+    elif args.work_map_action == "check":
         payload = check_work_map(adapter, workspace)
     elif args.work_map_action == "start":
         payload = start_work_item(adapter, workspace, args.item, args.task_id)
@@ -1574,22 +1691,6 @@ def write_event_manifest(
     return []
 
 
-def validate_validation_receipts(
-    receipt_paths: list[str],
-    workspace: Path,
-) -> list[dict]:
-    findings: list[dict] = []
-    for raw_path in sorted(set(receipt_paths)):
-        candidate = Path(raw_path)
-        target = candidate if candidate.is_absolute() else workspace / candidate
-        if not target.is_file():
-            findings.append({
-                "code": "validation-receipt-missing",
-                "path": raw_path,
-            })
-    return findings
-
-
 def evaluate_impact_path_reconciliation(
     impact_receipt: dict,
     actual_paths: list[str],
@@ -1615,70 +1716,6 @@ def evaluate_impact_path_reconciliation(
         for path in sorted(planned - actual)
     ]
     return findings, warnings
-
-
-def validate_structured_validation_receipt(
-    receipt_path: Path,
-    workspace: Path,
-    freeze_receipt: dict,
-) -> tuple[dict | None, list[dict]]:
-    try:
-        receipt = load_json(receipt_path)
-    except FileNotFoundError:
-        return None, [{"code": "validation-receipt-missing", "path": str(receipt_path)}]
-    except SystemExit:
-        return None, [{"code": "validation-receipt-malformed", "path": str(receipt_path)}]
-    findings: list[dict] = []
-    if receipt.get("schema") != "govern-ai-coding.validation-receipt.v1":
-        findings.append({"code": "validation-receipt-schema-invalid", "path": str(receipt_path)})
-    if receipt.get("result") != "pass":
-        findings.append({"code": "validation-receipt-result-not-pass", "path": str(receipt_path)})
-    expected_freeze = canonical_json_digest(freeze_receipt)
-    if (receipt.get("freeze") or {}).get("digest") != expected_freeze:
-        findings.append({"code": "validation-receipt-freeze-mismatch", "path": str(receipt_path)})
-    frozen = receipt.get("frozen_paths")
-    if not isinstance(frozen, list):
-        findings.append({"code": "validation-receipt-frozen-paths-invalid", "path": str(receipt_path)})
-        frozen = []
-    expected_paths = {
-        entry.get("path"): entry.get("digest")
-        for entry in freeze_receipt.get("paths", [])
-        if isinstance(entry, dict)
-    }
-    actual_paths = {
-        entry.get("path"): entry.get("digest")
-        for entry in frozen
-        if isinstance(entry, dict)
-    }
-    if actual_paths != expected_paths:
-        findings.append({"code": "validation-receipt-frozen-paths-mismatch", "path": str(receipt_path)})
-    for path, digest in expected_paths.items():
-        target = workspace / path
-        if not target.is_file() or file_digest(target) != digest:
-            findings.append({"code": "validation-receipt-frozen-content-mismatch", "path": path})
-    commands = receipt.get("commands")
-    if not isinstance(commands, list) or not commands or any(
-        not isinstance(command, dict)
-        or not isinstance(command.get("command"), str)
-        or command.get("result") != "pass"
-        for command in commands
-    ):
-        findings.append({"code": "validation-receipt-commands-invalid", "path": str(receipt_path)})
-    for field in ("environment", "supported_claims", "unsupported_claims"):
-        value = receipt.get(field)
-        if field == "environment":
-            valid = isinstance(value, dict) and bool(value)
-        else:
-            valid = is_string_list(value) and bool(value)
-        if not valid:
-            findings.append({"code": "validation-receipt-field-invalid", "field": field})
-    if findings:
-        return None, findings
-    return {
-        "path": str(receipt_path),
-        "digest": canonical_json_digest(receipt),
-        "schema": receipt["schema"],
-    }, []
 
 
 def impact_command(args: argparse.Namespace) -> None:
@@ -1781,6 +1818,40 @@ def impact_command(args: argparse.Namespace) -> None:
     receipt = None
     receipt_findings = []
     impact_unverified = ["empty-impact-scope"] if not changed_paths else []
+    work_map_baseline = None
+    work_map_findings: list[dict] = []
+    recovery_actions: list[str] = []
+    binding = manifest.get("work_map_binding") if manifest is not None else None
+    if binding is not None:
+        if not isinstance(adapter.get("work_map"), dict):
+            work_map_findings.append({
+                "code": "work-map-config-required",
+                "message": "A Work Map binding requires adapter work_map configuration.",
+            })
+        elif args.workspace:
+            _, destination_findings = resolve_receipt_output_path(
+                binding["attestation_path"],
+                Path(args.workspace),
+                adapter,
+            )
+            work_map_findings.extend({
+                **finding,
+                "code": "unsafe-attestation-output-path",
+            } for finding in destination_findings)
+            try:
+                work_map_baseline, binding_findings = verify_work_map_binding(
+                    adapter,
+                    Path(args.workspace),
+                    binding,
+                )
+            except (OSError, UnicodeError) as exc:
+                impact_unverified.append("work-map-baseline-unreadable")
+                recovery_actions.append(
+                    "Restore readable baseline Work Map evidence and rerun Impact before edits."
+                )
+                work_map_baseline = None
+            else:
+                work_map_findings.extend(binding_findings)
     if args.workspace:
         workspace = Path(args.workspace)
         source = args.change_source
@@ -1846,6 +1917,8 @@ def impact_command(args: argparse.Namespace) -> None:
             "project_authority": False,
             "recovery": "Pass this receipt to Closeout with --receipt, plus actual changed paths and event-authorized documents.",
         }
+        if binding is not None:
+            receipt["work_map_baseline"] = work_map_baseline
 
     recovery = "Impact completed; run Closeout before declaring completion."
     if "git-change-source-unavailable" in impact_unverified:
@@ -1855,7 +1928,7 @@ def impact_command(args: argparse.Namespace) -> None:
             "and retain the resulting unproven boundary."
         )
     payload = {
-        "result": "fail" if path_findings or receipt_findings or manifest_findings else "unproven" if impact_unverified or human or protected or excluded else "pass",
+        "result": "fail" if path_findings or receipt_findings or manifest_findings or work_map_findings else "unproven" if impact_unverified or human or protected or excluded else "pass",
         "coverage": {
             "unverified": impact_unverified,
         },
@@ -1869,11 +1942,12 @@ def impact_command(args: argparse.Namespace) -> None:
             "approval_requirements": approval_requirements,
         },
         "receipt": receipt,
-        "mechanical_findings": path_findings + receipt_findings + manifest_findings,
+        "mechanical_findings": path_findings + receipt_findings + manifest_findings + work_map_findings,
         "semantic_findings": [],
         "human_approval_required": human,
         "warnings": adapter_result.get("warnings", []),
         "recovery": recovery,
+        "recovery_actions": recovery_actions,
     }
     output_path = None
     if args.write_receipt and receipt is not None and payload["result"] != "fail":
@@ -4616,6 +4690,9 @@ def freeze_command(args: argparse.Namespace) -> None:
         },
         "recovery": "Run project-selected final validation, then pass this receipt to live Closeout with --freeze-receipt.",
     }
+    git_commit = _attested_final_git_commit(workspace, snapshots)
+    if git_commit is not None:
+        receipt["git_commit"] = git_commit
     output_path = None
     if not findings:
         output_path, write_findings = write_receipt_file(
@@ -6543,86 +6620,198 @@ def receipt_payload_from_args(
     return loaded if isinstance(loaded, dict) else None
 
 
-def build_closeout_attestation(
+def evaluate_work_map_closeout(
     payload: dict,
     args: argparse.Namespace,
     manifest: dict | None,
     workspace: Path,
     adapter: dict,
-) -> dict:
-    final_content = []
-    for path in payload.get("closeout", {}).get("actual_paths", []):
-        target = (workspace / path).resolve()
-        exists = target.is_file()
-        final_content.append({
-            "path": path,
-            "existence": exists,
-            "digest": file_digest(target) if exists else None,
+) -> tuple[dict | None, list[dict]]:
+    """Verify a bound final Work Map using already-validated event receipts."""
+    binding = manifest.get("work_map_binding") if manifest is not None else None
+    if binding is None:
+        return None, []
+    if not isinstance(adapter.get("work_map"), dict):
+        return None, [{
+            "code": "work-map-config-required",
+            "message": "A Work Map binding requires adapter work_map configuration.",
+        }]
+
+    work_map_path = adapter["work_map"]["path"]
+    findings: list[dict] = []
+    actual_paths = set((payload.get("closeout") or {}).get("actual_paths", []))
+    if work_map_path not in actual_paths:
+        findings.append({
+            "code": "work-map-path-not-actual",
+            "path": work_map_path,
         })
-    impact_receipt = receipt_payload_from_args(args, kind="impact")
+
     freeze_receipt = receipt_payload_from_args(args, kind="freeze")
-    semantic_review_binding = (payload.get("semantic_review") or {}).get("binding")
-    if not (
-        isinstance(semantic_review_binding, dict)
-        and isinstance(semantic_review_binding.get("source"), str)
-        and isinstance(semantic_review_binding.get("digest"), str)
-    ):
-        semantic_review_binding = None
-    validation_receipts = sorted(set(args.validation_receipt))
-    if manifest is not None:
-        validation_receipts = sorted(set(
-            validation_receipts
-            + manifest.get("receipts", {}).get("validation", [])
-        ))
-    validation_bindings = getattr(args, "validation_receipt_bindings", None)
-    return {
-        "schema": CLOSEOUT_ATTESTATION_SCHEMA,
-        "schema_version": "1",
-        "kind": "closeout-attestation",
-        "immutable": True,
-        "adapter": {
-            "project": adapter.get("project"),
-            "schema_version": adapter.get("schema_version"),
-        },
-        "event": {
-            "id": manifest.get("event", {}).get("id") if manifest else None,
-            "goal": manifest.get("event", {}).get("goal") if manifest else None,
-            "baseline_ref": (
-                manifest.get("event", {}).get("baseline_ref")
-                if manifest
-                else (impact_receipt or {})
-                .get("inventory_source", {})
-                .get("metadata", {})
-                .get("baseline_ref")
-            ),
-            "workspace": str(workspace.resolve()),
-        },
-        "result": "pass",
-        "actual_paths": sorted(payload.get("closeout", {}).get("actual_paths", [])),
-        "final_content": final_content,
-        "approvals": payload.get("approval_summary", {}),
-        "receipt_bindings": {
-            "impact": canonical_json_digest(impact_receipt) if impact_receipt else None,
-            "semantic_review": semantic_review_binding,
-            "freeze": canonical_json_digest(freeze_receipt) if freeze_receipt else None,
-            "validation": (
-                validation_bindings
-                if validation_bindings is not None
-                else validation_receipts
-            ),
-        },
-        "work_map_binding": (
-            manifest.get("work_map_binding")
-            if manifest is not None
-            else None
-        ),
-        "result_reasons": list(payload.get("result_reasons", [])),
-        "recovery_actions": list(payload.get("recovery_actions", [])),
-        "limitations": list((payload.get("coverage") or {}).get("cannot_prove", [])),
-        "derived_evidence": True,
-        "generated": True,
-        "project_authority": False,
+    frozen_entry = next((
+        entry
+        for entry in (freeze_receipt or {}).get("paths", [])
+        if isinstance(entry, dict) and entry.get("path") == work_map_path
+    ), None)
+    frozen_paths = {
+        entry.get("path")
+        for entry in (freeze_receipt or {}).get("paths", [])
+        if isinstance(entry, dict)
     }
+    if work_map_path not in frozen_paths:
+        findings.append({
+            "code": "work-map-path-not-frozen",
+            "path": work_map_path,
+        })
+
+    expected_baseline = {
+        "item_id": binding.get("item_id"),
+        "task_id": binding.get("task_id"),
+        "source_digest": binding.get("source_digest"),
+        "expected_disposition": binding.get("expected_disposition"),
+        "path": work_map_path,
+    }
+    external_impact_receipt = None
+    impact_receipt_destination = None
+    if not args.receipt:
+        findings.append({
+            "code": "work-map-impact-receipt-required",
+            "message": "Bound Work Map Closeout requires the preserved external Impact receipt.",
+        })
+    else:
+        impact_receipt_destination, input_path_findings = (
+            resolve_receipt_output_path(args.receipt, workspace, adapter)
+        )
+        findings.extend({
+            **finding,
+            "code": "unsafe-work-map-impact-receipt-path",
+        } for finding in input_path_findings)
+        if impact_receipt_destination is not None:
+            try:
+                external_payload = load_json(impact_receipt_destination)
+            except FileNotFoundError:
+                findings.append({
+                    "code": "work-map-impact-receipt-missing",
+                    "path": str(impact_receipt_destination),
+                })
+            except (OSError, SystemExit, UnicodeError) as exc:
+                findings.append({
+                    "code": "work-map-impact-receipt-invalid",
+                    "path": str(impact_receipt_destination),
+                    "message": str(exc),
+                })
+            else:
+                external_impact_receipt, external_findings = extract_impact_receipt(
+                    external_payload
+                )
+                findings.extend({
+                    **finding,
+                    "code": "work-map-impact-receipt-invalid",
+                    "path": str(impact_receipt_destination),
+                } for finding in external_findings)
+
+    if args.write_receipt:
+        closeout_receipt_destination, output_path_findings = (
+            resolve_receipt_output_path(args.write_receipt, workspace, adapter)
+        )
+        findings.extend({
+            **finding,
+            "code": "unsafe-closeout-receipt-output-path",
+        } for finding in output_path_findings)
+        same_receipt_identity = (
+            impact_receipt_destination is not None
+            and closeout_receipt_destination is not None
+            and impact_receipt_destination == closeout_receipt_destination
+        )
+        if (
+            not same_receipt_identity
+            and impact_receipt_destination is not None
+            and closeout_receipt_destination is not None
+            and impact_receipt_destination.exists()
+            and closeout_receipt_destination.exists()
+        ):
+            try:
+                same_receipt_identity = os.path.samefile(
+                    impact_receipt_destination,
+                    closeout_receipt_destination,
+                )
+            except OSError:
+                same_receipt_identity = False
+        if same_receipt_identity:
+            findings.append({
+                "code": "work-map-impact-receipt-output-alias",
+                "path": str(impact_receipt_destination),
+                "output_path": args.write_receipt,
+            })
+
+    manifest_impact_receipt = (manifest.get("receipts") or {}).get("impact")
+    if not isinstance(manifest_impact_receipt, dict):
+        findings.append({
+            "code": "work-map-manifest-impact-receipt-missing",
+        })
+    elif (
+        external_impact_receipt is not None
+        and (
+            external_impact_receipt != manifest_impact_receipt
+            or canonical_json_digest(external_impact_receipt)
+            != canonical_json_digest(manifest_impact_receipt)
+        )
+    ):
+        findings.append({
+            "code": "work-map-impact-receipt-mismatch",
+            "path": str(impact_receipt_destination),
+        })
+
+    if (external_impact_receipt or {}).get("work_map_baseline") != expected_baseline:
+        findings.append({
+            "code": "work-map-impact-baseline-mismatch",
+            "path": work_map_path,
+        })
+
+    if args.write_attestation != binding.get("attestation_path"):
+        findings.append({
+            "code": "work-map-attestation-destination-mismatch",
+            "expected": binding.get("attestation_path"),
+            "actual": args.write_attestation,
+        })
+
+    if findings:
+        return None, findings
+    try:
+        observation, observation_findings = observe_work_map_final(
+            adapter,
+            workspace,
+            binding,
+        )
+    except (OSError, UnicodeError) as exc:
+        return None, [{
+            "code": "work-map-final-unreadable",
+            "path": work_map_path,
+            "message": str(exc),
+        }]
+    if observation is not None and isinstance(frozen_entry, dict):
+        observation = {
+            **observation,
+            "frozen_file_digest": frozen_entry.get("digest"),
+        }
+    return observation, observation_findings
+
+
+def _attested_final_git_commit(workspace: Path, final_content: list[dict]) -> str | None:
+    commit, _ = resolve_git_baseline(workspace, "HEAD")
+    if commit is None:
+        return None
+    for entry in final_content:
+        object_name = f"{commit}:{entry['path']}"
+        blob = subprocess.run(
+            ["git", "show", object_name], cwd=workspace, check=False,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        if entry["existence"]:
+            if blob.returncode != 0 or hashlib.sha256(blob.stdout).hexdigest() != entry["digest"]:
+                return None
+        elif blob.returncode == 0:
+            return None
+    return commit
 
 
 def write_closeout_attestation(
@@ -6780,39 +6969,30 @@ def closeout_command(args: argparse.Namespace) -> None:
             args,
         )
         payload["warnings"] = list(payload.get("warnings", [])) + compatibility_warnings
+        work_map_observation, work_map_findings = evaluate_work_map_closeout(
+            payload,
+            args,
+            manifest,
+            Path(args.workspace),
+            adapter,
+        )
+        if work_map_findings:
+            payload["mechanical_findings"].extend(work_map_findings)
+            payload["result"] = "fail"
+            payload["closeout_receipt"]["result"] = "fail"
         validation_receipts = list(args.validation_receipt)
         if manifest is not None:
             validation_receipts.extend(manifest["receipts"].get("validation", []))
-        validation_findings = validate_validation_receipts(
+        freeze_payload = receipt_payload_from_args(args, kind="freeze")
+        validation_evidence, validation_findings = collect_validation_evidence(
             validation_receipts,
             Path(args.workspace),
+            freeze_receipt=freeze_payload,
+            require_freeze_binding=(
+                manifest is not None
+                and manifest.get("work_map_binding") is not None
+            ),
         )
-        if manifest is not None and manifest.get("work_map_binding") is not None:
-            freeze_payload = receipt_payload_from_args(args, kind="freeze")
-            structured_bindings: list[dict] = []
-            if not isinstance(freeze_payload, dict):
-                validation_findings.append({
-                    "code": "validation-receipt-freeze-missing",
-                })
-            else:
-                for raw_path in sorted(set(validation_receipts)):
-                    candidate = Path(raw_path)
-                    target = (
-                        candidate
-                        if candidate.is_absolute()
-                        else Path(args.workspace) / candidate
-                    )
-                    binding, strict_findings = (
-                        validate_structured_validation_receipt(
-                            target,
-                            Path(args.workspace),
-                            freeze_payload,
-                        )
-                    )
-                    validation_findings.extend(strict_findings)
-                    if binding is not None:
-                        structured_bindings.append(binding)
-            args.validation_receipt_bindings = structured_bindings
         if validation_findings:
             payload["mechanical_findings"].extend(validation_findings)
             payload["result"] = "fail"
@@ -6821,7 +7001,11 @@ def closeout_command(args: argparse.Namespace) -> None:
             payload["mechanical_findings"].extend(manifest_findings)
             payload["result"] = "fail"
             payload["closeout_receipt"]["result"] = "fail"
-        if args.write_receipt:
+        impact_receipt_output_alias = any(
+            finding.get("code") == "work-map-impact-receipt-output-alias"
+            for finding in work_map_findings
+        )
+        if args.write_receipt and not impact_receipt_output_alias:
             output_path, write_findings = write_receipt_file(
                 payload["closeout_receipt"],
                 args.write_receipt,
@@ -6833,15 +7017,25 @@ def closeout_command(args: argparse.Namespace) -> None:
                 payload["mechanical_findings"].extend(write_findings)
                 payload["result"] = "fail"
                 payload["closeout_receipt"]["result"] = "fail"
+        elif args.write_receipt:
+            payload["receipt_output"] = None
+        if payload["result"] == "pass" and work_map_observation is not None:
+            payload["work_map_observation"] = work_map_observation
+        else:
+            payload.pop("work_map_observation", None)
         payload = add_structured_closeout_recovery(payload)
         if args.write_attestation:
             if payload["result"] == "pass":
-                attestation = build_closeout_attestation(
+                attestation = build_evidence_attestation(
                     payload,
-                    args,
-                    manifest,
-                    Path(args.workspace),
-                    adapter,
+                    adapter=adapter,
+                    workspace=Path(args.workspace),
+                    manifest=manifest,
+                    impact_receipt=receipt_payload_from_args(
+                        args, kind="impact",
+                    ),
+                    freeze_receipt=freeze_payload,
+                    validation_evidence=validation_evidence,
                 )
                 attestation_summary, attestation_findings = write_closeout_attestation(
                     attestation,
@@ -6900,7 +7094,65 @@ def closeout_command(args: argparse.Namespace) -> None:
             "cases": args.cases,
             "workspace": args.workspace,
         }
+    if payload.get("result") != "pass":
+        payload.pop("work_map_observation", None)
     emit(add_structured_closeout_recovery(payload))
+
+
+def verify_integration_command(args: argparse.Namespace) -> None:
+    emit(verify_integration(
+        adapter_path=Path(args.adapter),
+        source_workspace=Path(args.workspace),
+        manifest_path=Path(args.event_manifest),
+        attestation_path=Path(args.attestation),
+        target_workspace=Path(args.target_workspace),
+        target_adapter=args.target_adapter,
+        target_ref=args.target_ref,
+    ))
+
+
+def preflight_event_command(args: argparse.Namespace) -> None:
+    try:
+        adapter = load_json(Path(args.adapter))
+        current = load_json(Path(args.event_manifest))
+    except (FileNotFoundError, SystemExit):
+        emit({
+            "result": "unproven",
+            "conflicts": [],
+            "warnings": [{"code": "current-declaration-unproven"}],
+            "visibility_boundary": "Only supplied paths were inspected.",
+        })
+        return
+    peers = []
+    for raw_path in args.peer_manifest:
+        path = Path(raw_path)
+        try:
+            peer_manifest = load_json(path)
+        except (FileNotFoundError, SystemExit):
+            peer_manifest = {}
+        event = peer_manifest.get("event")
+        raw_workspace = event.get("workspace") if isinstance(event, dict) else None
+        if isinstance(raw_workspace, str) and raw_workspace:
+            peer_workspace = Path(raw_workspace)
+            if not peer_workspace.is_absolute():
+                peer_workspace = path.parent / peer_workspace
+        else:
+            peer_workspace = Path(args.workspace)
+        pointer = (peer_manifest.get("receipts") or {}).get(
+            "closeout_attestation"
+        )
+        attestation = pointer.get("path") if isinstance(pointer, dict) else None
+        peers.append({
+            "manifest": peer_manifest,
+            "workspace": peer_workspace,
+            "attestation": attestation,
+        })
+    emit(preflight_declared_events(
+        adapter=adapter,
+        workspace=Path(args.workspace),
+        current_manifest=current,
+        peers=peers,
+    ))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -6994,6 +7246,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     closeout.set_defaults(func=closeout_command)
 
+    verify_integration_parser = sub.add_parser("verify-integration")
+    verify_integration_parser.add_argument("adapter")
+    verify_integration_parser.add_argument("--workspace", required=True)
+    verify_integration_parser.add_argument("--event-manifest", required=True)
+    verify_integration_parser.add_argument("--attestation", required=True)
+    verify_integration_parser.add_argument("--target-workspace", required=True)
+    verify_integration_parser.add_argument("--target-adapter", required=True)
+    verify_integration_parser.add_argument("--target-ref")
+    verify_integration_parser.set_defaults(func=verify_integration_command)
+
+    preflight_event = sub.add_parser("preflight-event")
+    preflight_event.add_argument("adapter")
+    preflight_event.add_argument("--workspace", required=True)
+    preflight_event.add_argument("--event-manifest", required=True)
+    preflight_event.add_argument(
+        "--peer-manifest", action="append", default=[], required=True,
+    )
+    preflight_event.set_defaults(func=preflight_event_command)
+
     controlled_archive = sub.add_parser("controlled-archive")
     controlled_archive.add_argument("adapter")
     controlled_archive.add_argument("--workspace", required=True)
@@ -7053,6 +7324,12 @@ def build_parser() -> argparse.ArgumentParser:
     work_map_check.add_argument("adapter")
     work_map_check.add_argument("--workspace", required=True)
     work_map_check.set_defaults(func=work_map_command)
+
+    work_map_status_parser = work_map_sub.add_parser("status")
+    work_map_status_parser.add_argument("adapter")
+    work_map_status_parser.add_argument("--workspace", required=True)
+    work_map_status_parser.add_argument("--event-manifest", required=True)
+    work_map_status_parser.set_defaults(func=work_map_command)
 
     work_map_start = work_map_sub.add_parser("start")
     work_map_start.add_argument("adapter")

@@ -150,7 +150,13 @@ adapter-owned; the core does not hard-code project languages or status words.
 
 `work-map check|start|finish|render` returns `result`, source path/heading/table
 digest, target, ordered checks, proposed fields, unified patch, recovery
-actions, and claim boundary. Commands never mutate the workspace.
+actions, and claim boundary. `work-map status` additionally requires an event
+manifest with `work_map_binding`; it returns the current observation and its
+attestation relation. Commands never mutate the workspace. The table's status
+vocabulary is adapter-owned: the core maps a transition disposition to the
+configured progress classification rather than treating a label as universal.
+The first configured value is the canonical `start` or `finish` output, while
+final observation accepts any configured value for the expected disposition.
 
 An event manifest may add:
 
@@ -166,13 +172,25 @@ An event manifest may add:
 }
 ```
 
+`source_digest` is the full Work Map source-table digest captured at the event baseline.
+It is distinct from `final_table_digest`, which records the final
+table observed for the attestation.
+
 With this binding, unplanned actual paths fail, unused planned paths warn, and
 Closeout requires `govern-ai-coding.validation-receipt.v1`. That receipt must
 have result `pass`, bind the canonical Freeze digest and every frozen path
 digest, list passing commands and environment, and state supported and
-unsupported claims. The immutable attestation binds its canonical content
-digest. Events without `work_map_binding` retain the schema-1 legacy validation
-pointer behavior.
+unsupported claims. A pass Closeout attestation includes `work_map_observation`
+with the binding identity plus final table and typed-item digests. Read-only
+status requires that observation to match the current item and immutable
+attestation. Matching also verifies the complete current attestation envelope
+against the validated manifest: schema and authority markers, adapter and event
+identity, final scope and content digests, receipt bindings, and the recorded
+attestation path and digest. Bound work that remains in any configured active
+state is `unproven`; only a proven identity or binding contradiction fails.
+An older attestation without the observation remains readable, but is
+`unproven` for current governance closure. Events without
+`work_map_binding` retain the schema-1 legacy validation pointer behavior.
 
 Missing adapter files return `unproven` with `adapter-missing` rather than a
 traceback. Create a candidate adapter from project pointers and ask for human
@@ -242,6 +260,34 @@ environment or toolchain, and supported claim. After a governed post-Freeze
 edit, create a new Freeze, rerun the project-selected affected validation, and
 rerun Closeout; the checker does not select project tests, and no adapter field
 is added.
+
+A current structured receipt has this project-independent shape:
+
+```json
+{
+  "schema": "govern-ai-coding.validation-receipt.v1",
+  "result": "pass",
+  "freeze": {"digest": "<canonical-freeze-sha256>"},
+  "input_classes": ["paths"],
+  "frozen_paths": [
+    {"path": "relative/path", "digest": "<file-sha256>"}
+  ],
+  "commands": [
+    {"command": "<project-selected validation>", "result": "pass"}
+  ],
+  "environment": {"runtime": "<identity>"},
+  "supported_claims": ["<bounded claim>"],
+  "unsupported_claims": ["<explicitly unsupported claim>"]
+}
+```
+
+The Freeze digest is SHA-256 over its UTF-8 canonical JSON: sorted object keys,
+no insignificant whitespace, and `,` / `:` separators. `frozen_paths` repeats
+every Freeze path and digest; use JSON `null` for a frozen missing file. The
+optional `input_classes` field enables bounded post-integration inheritance;
+omitting it leaves the validation receipt usable for Closeout but supplies no
+inheritable validation-input claim. Present input classes must be a non-empty
+list. Commands, environment, and claim wording remain project-selected.
 
 | Change or result | Validation action |
 | --- | --- |
@@ -571,6 +617,47 @@ recovery, and known limitations. It includes:
 The Semantic Review binding is computed during review validation and carried
 into the attestation. The attestation writer does not reread the review path
 after validation.
+
+New attestations add the canonical adapter digest. When every frozen path
+matches the current Git `HEAD`, Freeze records that commit and Closeout binds
+the same value as `event.final_git_commit`. A
+structured validation receipt may declare `input_classes` such as `paths`,
+`adapter`, or `git-history`; its commands, environment, frozen paths, claims,
+and receipt identity are copied into `validation_inputs` and rebound when the
+attestation is consumed. Older attestations remain readable, but missing
+additive identity or input evidence limits dependent conclusions to
+`unproven`.
+
+## Post-Integration Verification
+
+`verify-integration` requires the source adapter, source workspace, source
+event manifest, immutable attestation, target workspace, and target adapter
+path. An optional Git ref reads target blobs without checkout. The result
+separates attestation binding, target adapter identity, per-path content,
+ancestry or unresolved-index evidence, and per-claim validation inheritance.
+Only explicitly declared input classes with direct target evidence can pass;
+unknown or unavailable classes remain `unproven`. Changes outside attested
+paths do not invalidate content evidence. The command is read-only and does
+not prove branch, release, deployment, or product readiness.
+
+## Declared Event Preflight
+
+`preflight-event` accepts one current event manifest and one or more explicitly
+supplied peer manifests. Mutation scope is the union of `planned_paths`,
+`actual_event_paths`, `governed_authority_documents`, and
+`authorized_development_paths`; `evidence_only_paths` does not assert a
+mutation. Exact path overlap and different tasks bound to one Work Map item are
+deterministic conflicts. Dependency completion uses only the adapter's Work Map
+mapping and configured completed values. Authority-rule overlap is a warning,
+not proof of a conflict.
+
+A baseline-change conflict additionally requires a valid current embedded
+Impact receipt and peer Closeout evidence rebound through the peer's own
+manifest and workspace. Missing, historical, malformed, wrong-event,
+wrong-workspace, or wrong-scope peer evidence remains `unproven` and cannot
+create that conflict. The command has no visibility beyond supplied
+declarations and evidence; it does not enumerate or control sessions, tasks,
+processes, branches, or worktrees and is not a scheduler or lock manager.
 
 When an event manifest is used, `receipts.closeout_attestation` is recorded
 only after successful creation. The acceptance report should already name that future
