@@ -47,6 +47,52 @@ MUTATION_SCOPE_KEYS = (
 CURRENT_ATTESTATION_SCHEMAS = ["govern-ai-coding.closeout-attestation.v1"]
 
 
+def _event_diagnostic(item: dict, *, severity: str) -> dict:
+    code = str(item.get("code", "event-preflight-finding"))
+    messages = {
+        "work-item-task-conflict": "Different tasks claim the same Work Map item.",
+        "exact-path-overlap": "Declared event mutation paths overlap.",
+        "unfinished-dependency": "A declared Work Map dependency is unfinished.",
+        "declared-baseline-input-changed": "Trusted peer evidence changed a declared baseline input.",
+        "authority-scope-overlap": "Declared events overlap an authority rule or scope without an exact path conflict.",
+        "work-map-dependencies-unproven": "Configured Work Map dependencies could not be proven complete.",
+        "current-baseline-unproven": "The current event baseline could not be proven for peer comparison.",
+        "peer-evidence-unproven": "Peer Closeout evidence could not be bound to its declaration.",
+    }
+    recovery = {
+        "work-item-task-conflict": "Bind only one active task to the Work Map item, or move one event to a different approved item.",
+        "exact-path-overlap": "Separate the overlapping mutation paths or serialize the declared events before editing.",
+        "unfinished-dependency": "Complete or explicitly replan the listed dependency before starting the dependent event.",
+        "declared-baseline-input-changed": "Reconcile the changed baseline input and run a new Impact before continuing the affected event.",
+        "authority-scope-overlap": "Review the shared authority scope and coordinate ownership before continuing either event.",
+        "work-map-dependencies-unproven": "Restore readable Work Map evidence and rerun only declared event preflight.",
+        "current-baseline-unproven": "Provide a verified current Impact baseline and rerun only declared event preflight.",
+        "peer-evidence-unproven": "Provide matching immutable peer Closeout evidence and rerun only declared event preflight.",
+    }
+    paths = sorted(set(
+        path for path in item.get("paths", []) if isinstance(path, str) and path
+    ))
+    fields = {
+        key: value
+        for key, value in item.items()
+        if key not in {"code", "paths"}
+    }
+    diagnostic = {
+        "severity": severity,
+        "category": "scope_mismatch",
+        "code": code,
+        "message": messages.get(code, code.replace("-", " ")),
+        "recovery_actions": [
+            recovery.get(code, "Resolve this declared-event finding and rerun only preflight.")
+        ],
+    }
+    if paths:
+        diagnostic["paths"] = paths
+    if fields or not paths:
+        diagnostic["fields"] = fields
+    return diagnostic
+
+
 def _safe_path(value: object) -> bool:
     if not isinstance(value, str) or not value or "\\" in value:
         return False
@@ -421,10 +467,21 @@ def preflight_declared_events(
         result = "unproven"
     else:
         result = "pass"
+    diagnostics = [
+        *(_event_diagnostic(item, severity="blocking") for item in conflicts),
+        *(_event_diagnostic(item, severity="unproven") for item in warnings),
+    ]
     return {
         "result": result,
         "conflicts": conflicts,
         "warnings": warnings,
+        "diagnostics": sorted(
+            diagnostics,
+            key=lambda item: (
+                item["severity"], item["category"], item["code"],
+                str(item.get("fields", {})), str(item.get("paths", [])),
+            ),
+        ),
         "visibility_boundary": (
             "Only the supplied manifests, configured Work Map facts, adapter "
             "rules, and explicitly bound peer evidence were inspected."

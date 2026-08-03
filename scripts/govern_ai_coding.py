@@ -206,18 +206,97 @@ DEFAULT_INVENTORY_EXCLUDE_COMPONENTS = {
 }
 
 
-def load_json(path: Path) -> dict:
+def json_type_name(value: object) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, dict):
+        return "object"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, (int, float)):
+        return "number"
+    return type(value).__name__
+
+
+def load_json_object(
+    path: Path,
+    *,
+    input_name: str,
+    category: str,
+) -> tuple[dict | None, dict | None]:
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        raise SystemExit(f"invalid JSON in {path}: {exc}") from exc
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        raise
+    except UnicodeError as exc:
+        actual = "invalid UTF-8"
+        message = f"{input_name} is not readable UTF-8: {exc}"
+        code = f"{input_name}-unreadable"
+    except OSError as exc:
+        actual = "unreadable"
+        message = f"{input_name} could not be read: {exc}"
+        code = f"{input_name}-unreadable"
+    else:
+        try:
+            value = json.loads(text)
+        except json.JSONDecodeError as exc:
+            actual = "invalid JSON"
+            message = f"{input_name} contains invalid JSON: {exc}"
+            code = f"{input_name}-invalid-json"
+        else:
+            if isinstance(value, dict):
+                return value, None
+            actual = json_type_name(value)
+            message = f"{input_name} root must be a JSON object, received {actual}"
+            code = f"{input_name}-root-not-object"
+    recovery = f"Provide a readable UTF-8 JSON object for {input_name} and rerun only this command."
+    return None, {
+        "code": code,
+        "severity": "blocking",
+        "category": category,
+        "message": message,
+        "field": input_name,
+        "path": str(path),
+        "expected": "JSON object",
+        "actual": actual,
+        "recovery_actions": [recovery],
+    }
+
+
+def load_json(path: Path) -> dict:
+    value, finding = load_json_object(
+        path,
+        input_name="json-input",
+        category="receipt_format",
+    )
+    if finding is not None:
+        raise SystemExit(finding["message"])
+    return value
 
 
 def load_json_or_missing(path: Path) -> tuple[dict | None, dict | None]:
     try:
-        return load_json(path), None
+        adapter, finding = load_json_object(
+            path,
+            input_name="adapter",
+            category="adapter_configuration",
+        )
     except FileNotFoundError:
         return None, adapter_missing_result(path)
+    if finding is None:
+        return adapter, None
+    return None, {
+        "result": "fail",
+        "adapter": {"path": str(path)},
+        "mechanical_findings": [finding],
+        "semantic_findings": [],
+        "human_approval_required": [],
+        "recovery": finding["recovery_actions"][0],
+    }
 
 
 def emit(payload: dict) -> None:
@@ -1707,6 +1786,17 @@ def evaluate_impact_path_reconciliation(
                 "preserve current edits and split the path into a separate event from "
                 "an isolated clean worktree or known clean filesystem copy."
             ],
+            "diagnostic": {
+                "severity": "blocking",
+                "category": "scope_mismatch",
+                "message": "An actual event path was absent from the Impact plan.",
+                "recovery_actions": [
+                    "If the preserved original Impact observed this path cleanly, use "
+                    "impact --extend-receipt with that receipt before Closeout. Otherwise "
+                    "preserve current edits and split the path into a separate event from "
+                    "an isolated clean worktree or known clean filesystem copy."
+                ],
+            },
         }
         for path in sorted(actual - planned)
     ]
@@ -1715,6 +1805,14 @@ def evaluate_impact_path_reconciliation(
             "code": "impact-planned-path-unused",
             "path": path,
             "message": "Impact planned path was not changed in this event.",
+            "diagnostic": {
+                "severity": "warning",
+                "category": "scope_mismatch",
+                "message": "Impact planned path was not changed in this event.",
+                "recovery_actions": [
+                    "No recovery is required; remove the unused path from a future plan if it is no longer expected."
+                ],
+            },
         }
         for path in sorted(planned - actual)
     ]
@@ -5988,6 +6086,35 @@ SEMANTIC_FINDING_KEYS = {
 }
 
 
+def semantic_review_shape_finding(
+    review_path: str,
+    *,
+    field: str,
+    expected: str,
+    actual: object,
+    actual_type: str | None = None,
+) -> dict:
+    actual_name = actual_type or json_type_name(actual)
+    return {
+        "code": "malformed-semantic-review",
+        "path": review_path,
+        "field": field,
+        "expected": expected,
+        "actual": actual_name,
+        "diagnostic": {
+            "severity": "blocking",
+            "category": "semantic_review",
+            "message": (
+                f"Semantic Review field {field} must be {expected}; "
+                f"received {actual_name}."
+            ),
+            "recovery_actions": [
+                f"Correct only {field} in the Semantic Review and rerun Closeout; retain still-valid Impact, Freeze, and validation evidence."
+            ],
+        },
+    }
+
+
 def evaluate_semantic_review(
     review_path: str | None,
     *,
@@ -6007,35 +6134,63 @@ def evaluate_semantic_review(
     unverified: list[str] = []
     review_file = Path(review_path)
     try:
-        review = load_json(review_file)
+        review, input_finding = load_json_object(
+            review_file,
+            input_name="semantic-review",
+            category="semantic_review",
+        )
     except FileNotFoundError:
         return {
             "status": "missing",
             "required": required,
             "findings": [],
         }, [{"code": "semantic-review-missing", "path": review_path}], [], []
-    except SystemExit:
+    if input_finding is not None:
         return {
             "status": "malformed",
             "required": required,
             "findings": [],
-        }, [{"code": "malformed-semantic-review", "path": review_path}], [], []
+        }, [semantic_review_shape_finding(
+            review_path,
+            field="root",
+            expected="JSON object",
+            actual=input_finding.get("actual"),
+            actual_type=str(input_finding.get("actual")),
+        )], [], []
 
     answers = review.get("answers")
-    answers_complete = (
-        isinstance(answers, dict)
-        and SEMANTIC_ANSWER_KEYS.issubset(answers)
-        and all(
-            (isinstance(answers.get(key), str) and bool(answers.get(key).strip()))
-            or (isinstance(answers.get(key), list) and bool(answers.get(key)))
-            for key in SEMANTIC_ANSWER_KEYS
+    if not isinstance(answers, dict):
+        mechanical.append(semantic_review_shape_finding(
+            review_path,
+            field="answers",
+            expected="object",
+            actual=answers,
+        ))
+        answers = {}
+    for key in sorted(SEMANTIC_ANSWER_KEYS):
+        value = answers.get(key)
+        valid = (
+            isinstance(value, str) and bool(value.strip())
+        ) or (
+            isinstance(value, list)
+            and bool(value)
+            and all(isinstance(item, str) and bool(item.strip()) for item in value)
         )
-    )
-    if not answers_complete:
-        mechanical.append({"code": "malformed-semantic-review", "path": review_path, "field": "answers"})
+        if not valid:
+            mechanical.append(semantic_review_shape_finding(
+                review_path,
+                field=f"answers.{key}",
+                expected="non-empty string or non-empty string list",
+                actual=value,
+            ))
     findings = review.get("findings")
     if not isinstance(findings, list):
-        mechanical.append({"code": "malformed-semantic-review", "path": review_path, "field": "findings"})
+        mechanical.append(semantic_review_shape_finding(
+            review_path,
+            field="findings",
+            expected="array",
+            actual=findings,
+        ))
         findings = []
 
     normalized_event = set(event_paths)
@@ -6043,8 +6198,31 @@ def evaluate_semantic_review(
     mechanical.extend(auth_findings)
     semantic_findings = []
     for index, finding in enumerate(findings):
-        if not isinstance(finding, dict) or not SEMANTIC_FINDING_KEYS.issubset(finding):
-            mechanical.append({"code": "malformed-semantic-review", "path": review_path, "finding": index})
+        if not isinstance(finding, dict):
+            mechanical.append(semantic_review_shape_finding(
+                review_path,
+                field=f"findings[{index}]",
+                expected="object",
+                actual=finding,
+            ))
+            continue
+        malformed_finding = False
+        for key in sorted(SEMANTIC_FINDING_KEYS):
+            value = finding.get(key)
+            valid = (
+                isinstance(value, bool)
+                if key == "human_boundary"
+                else isinstance(value, str) and bool(value.strip())
+            )
+            if not valid:
+                mechanical.append(semantic_review_shape_finding(
+                    review_path,
+                    field=f"findings[{index}].{key}",
+                    expected="boolean" if key == "human_boundary" else "non-empty string",
+                    actual=value,
+                ))
+                malformed_finding = True
+        if malformed_finding:
             continue
         semantic_findings.append(finding)
         status = finding.get("status")
@@ -6052,7 +6230,13 @@ def evaluate_semantic_review(
             unverified.append("unresolved-semantic-finding")
             continue
         if status != "resolved":
-            mechanical.append({"code": "malformed-semantic-review", "path": review_path, "finding": index, "field": "status"})
+            mechanical.append(semantic_review_shape_finding(
+                review_path,
+                field=f"findings[{index}].status",
+                expected="resolved or unresolved",
+                actual=status,
+                actual_type=str(status),
+            ))
             continue
         if not finding.get("resolution") or not finding.get("resolution_evidence"):
             unverified.append("semantic-resolution-evidence-missing")
@@ -6744,18 +6928,81 @@ def diagnostic_recovery(code: str, category: str) -> str:
     return "Resolve this finding and rerun only the affected governance step."
 
 
+DIAGNOSTIC_SEVERITIES = {"blocking", "unproven", "warning"}
+DIAGNOSTIC_CATEGORIES = {
+    "adapter_configuration",
+    "receipt_format",
+    "scope_mismatch",
+    "approval_evidence",
+    "freeze_invalidation",
+    "validation_missing",
+    "semantic_review",
+    "blocking",
+}
+
+
 def diagnostic_context(item: dict) -> tuple[dict, list[str]]:
-    fields = {
-        key: item[key]
-        for key in ("field", "type", "evidence", "target", "reason")
-        if key in item
+    fields = dict(item.get("fields", {})) if isinstance(item.get("fields"), dict) else {}
+    excluded = {
+        "category",
+        "code",
+        "diagnostic",
+        "fields",
+        "message",
+        "path",
+        "paths",
+        "recovery_actions",
+        "severity",
     }
+    for key, value in item.items():
+        if key in excluded:
+            continue
+        try:
+            json.dumps(value, sort_keys=True)
+        except (TypeError, ValueError):
+            continue
+        fields[key] = value
     paths: list[str] = []
     if isinstance(item.get("path"), str):
         paths.append(item["path"])
     if isinstance(item.get("paths"), list):
         paths.extend(str(path) for path in item["paths"])
     return fields, sorted(set(paths))
+
+
+def normalize_diagnostic(value: object) -> dict | None:
+    if not isinstance(value, dict):
+        return None
+    severity = value.get("severity")
+    category = value.get("category")
+    code = value.get("code")
+    message = value.get("message")
+    recovery_actions = value.get("recovery_actions")
+    if (
+        severity not in DIAGNOSTIC_SEVERITIES
+        or category not in DIAGNOSTIC_CATEGORIES
+        or not isinstance(code, str)
+        or not code
+        or not isinstance(message, str)
+        or not message
+        or not isinstance(recovery_actions, list)
+        or not recovery_actions
+        or not all(isinstance(action, str) and action for action in recovery_actions)
+    ):
+        return None
+    diagnostic = dict(value)
+    if "fields" in diagnostic and not isinstance(diagnostic["fields"], dict):
+        return None
+    if "paths" in diagnostic and (
+        not isinstance(diagnostic["paths"], list)
+        or not all(isinstance(path, str) and path for path in diagnostic["paths"])
+    ):
+        return None
+    if "paths" in diagnostic:
+        diagnostic["paths"] = sorted(set(diagnostic["paths"]))
+    if "fields" not in diagnostic and "paths" not in diagnostic:
+        diagnostic["fields"] = {}
+    return diagnostic
 
 
 def make_diagnostic(
@@ -6767,6 +7014,26 @@ def make_diagnostic(
     source: dict | None = None,
 ) -> dict:
     fields, paths = diagnostic_context(source or {})
+    explicit = (source or {}).get("diagnostic")
+    if isinstance(explicit, dict):
+        candidate = {
+            "code": code,
+            "message": message,
+            **explicit,
+        }
+        explicit_fields = candidate.get("fields")
+        if isinstance(explicit_fields, dict):
+            fields = {**fields, **explicit_fields}
+        if fields:
+            candidate["fields"] = fields
+        explicit_paths = candidate.get("paths")
+        if isinstance(explicit_paths, list):
+            paths = sorted(set(paths + explicit_paths))
+        if paths:
+            candidate["paths"] = paths
+        normalized = normalize_diagnostic(candidate)
+        if normalized is not None:
+            return normalized
     diagnostic = {
         "severity": severity,
         "category": category,
@@ -6789,7 +7056,11 @@ def add_structured_diagnostics(payload: dict) -> dict:
         and isinstance(payload.get("diagnostics"), list)
     ):
         return payload
-    diagnostics: list[dict] = []
+    diagnostics = [
+        diagnostic
+        for item in payload.get("diagnostics", []) or []
+        if (diagnostic := normalize_diagnostic(item)) is not None
+    ]
     for finding in payload.get("mechanical_findings", []) or []:
         if not isinstance(finding, dict):
             continue
@@ -6833,8 +7104,12 @@ def add_structured_diagnostics(payload: dict) -> dict:
             message=str(warning.get("message") or code.replace("-", " ")),
             source=warning,
         ))
+    unique_diagnostics = {
+        json.dumps(diagnostic, sort_keys=True, separators=(",", ":")): diagnostic
+        for diagnostic in diagnostics
+    }
     payload["diagnostics"] = sorted(
-        diagnostics,
+        unique_diagnostics.values(),
         key=lambda item: (
             item["severity"],
             item["category"],
@@ -6972,6 +7247,14 @@ def evaluate_work_map_closeout(
         findings.extend({
             **finding,
             "code": "unsafe-closeout-receipt-output-path",
+            "diagnostic": {
+                "severity": "blocking",
+                "category": "receipt_format",
+                "message": "The Closeout receipt output path is not a safe generated-evidence destination.",
+                "recovery_actions": [
+                    "Choose a new Closeout receipt output path outside governed authority or under an adapter-excluded generated-evidence directory."
+                ],
+            },
         } for finding in output_path_findings)
         same_receipt_identity = (
             impact_receipt_destination is not None

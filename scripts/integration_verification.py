@@ -271,6 +271,16 @@ def _untrusted_result(status: str) -> dict:
             "unproven_inputs": ["trusted-attestation"],
             "revalidate": [], "unsupported_claims": [],
         },
+        "diagnostics": [{
+            "severity": "blocking" if relation == "fail" else "unproven",
+            "category": "receipt_format",
+            "code": "integration-attestation-untrusted",
+            "message": f"Closeout attestation is not trusted: {status}.",
+            "fields": {"status": status},
+            "recovery_actions": [
+                "Provide the original immutable Closeout attestation and matching source event context, then rerun only integration verification."
+            ],
+        }],
         "claim_boundary": {
             "proves": [],
             "does_not_prove": [
@@ -278,6 +288,88 @@ def _untrusted_result(status: str) -> dict:
             ],
         },
     }
+
+
+def _integration_diagnostics(
+    *,
+    adapter: dict,
+    content: dict,
+    history: dict,
+    validation: dict,
+) -> list[dict]:
+    diagnostics: list[dict] = []
+    content_result = content.get("result")
+    if content_result != "pass":
+        affected_paths = sorted({
+            item.get("path")
+            for item in content.get("paths", [])
+            if isinstance(item, dict)
+            and item.get("result") != "pass"
+            and isinstance(item.get("path"), str)
+        })
+        diagnostics.append({
+            "severity": "blocking" if content_result == "fail" else "unproven",
+            "category": "freeze_invalidation",
+            "code": "integration-content-mismatch",
+            "message": "Integrated content does not match every attested path.",
+            "paths": affected_paths,
+            "recovery_actions": [
+                "Reconcile the listed target paths with the attested bytes or run affected validation and close a new governed event."
+            ],
+        })
+    adapter_result = adapter.get("result")
+    if adapter_result != "pass":
+        diagnostics.append({
+            "severity": "blocking" if adapter_result == "fail" else "unproven",
+            "category": "adapter_configuration",
+            "code": "integration-adapter-mismatch",
+            "message": "The target adapter cannot inherit the attested adapter claim.",
+            "fields": {"reason": adapter.get("reason")},
+            "recovery_actions": [
+                "Use the attested adapter identity or close a new governed event for the changed target adapter."
+            ],
+        })
+    history_result = history.get("result")
+    if history_result != "pass":
+        diagnostics.append({
+            "severity": "blocking" if history_result == "fail" else "unproven",
+            "category": "validation_missing",
+            "code": "integration-history-unproven",
+            "message": "Target Git history does not prove the attested integration relation.",
+            "fields": {"reason": history.get("reason")},
+            "recovery_actions": [
+                "Provide an observable target ref and ancestry relation, or retain the bounded history result as unproven."
+            ],
+        })
+    validation_result = validation.get("result")
+    if validation_result != "pass":
+        revalidate = [
+            value for value in validation.get("revalidate", [])
+            if isinstance(value, str) and value
+        ]
+        diagnostics.append({
+            "severity": "blocking" if validation_result == "fail" else "unproven",
+            "category": "validation_missing",
+            "code": (
+                "integration-validation-revalidation-required"
+                if revalidate
+                else "integration-validation-unproven"
+            ),
+            "message": "Validation claims cannot be inherited for every declared input.",
+            "fields": {
+                "revalidate": revalidate,
+                "unproven_inputs": validation.get("unproven_inputs", []),
+            },
+            "recovery_actions": [
+                "Run only the listed affected validation obligations and close a new governed event for changed inputs."
+                if revalidate
+                else "Provide directly observable evidence for each declared validation input."
+            ],
+        })
+    return sorted(
+        diagnostics,
+        key=lambda item: (item["severity"], item["category"], item["code"]),
+    )
 
 
 def verify_integration(
@@ -367,6 +459,12 @@ def verify_integration(
         "content": content,
         "history": history,
         "validation": validation,
+        "diagnostics": _integration_diagnostics(
+            adapter=adapter_result,
+            content=content,
+            history=history,
+            validation=validation,
+        ),
         "claim_boundary": {
             "proves": [
                 "attested paths",

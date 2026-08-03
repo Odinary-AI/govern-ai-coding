@@ -323,6 +323,18 @@ when applicable and a non-empty `recovery_actions` list. Follow the smallest rec
 do not restart a valid Impact merely because Freeze or one evidence pointer is
 missing.
 
+The module that detects a finding owns its severity, category, context, and
+minimum recovery action. Output aggregation preserves those diagnostics and
+the existing command-specific result fields. A validation receipt command
+uses the exact result value `pass`; explanatory text belongs outside that enum.
+If the value is invalid, follow the indexed receipt-only recovery action and do
+not repeat still-valid Impact, Freeze, review, or validation steps.
+
+Ordinary command JSON inputs that require an object fail as structured JSON
+when unreadable, malformed, or rooted at an array or scalar. Semantic Review
+also requires correctly typed finding fields; `human_boundary` is a boolean
+marker and does not itself select or prove an approval type.
+
 ## Integration Verification
 
 After integration, run the read-only verifier against the original immutable

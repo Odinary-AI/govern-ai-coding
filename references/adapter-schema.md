@@ -309,7 +309,13 @@ every Freeze path and digest; use JSON `null` for a frozen missing file. The
 optional `input_classes` field enables bounded post-integration inheritance;
 omitting it leaves the validation receipt usable for Closeout but supplies no
 inheritable validation-input claim. Present input classes must be a non-empty
-list. Commands, environment, and claim wording remain project-selected.
+list. Commands, environment, and claim wording remain project-selected. Every
+`commands[*].result` is the exact enum value `pass`; values such as `pass + 12
+tests` or `pass (reviewed)` are invalid. Explanatory text belongs in another
+project-owned field or evidence document, not in the result enum. A rejection
+identifies each invalid command index, the expected value, and the received
+value so only the receipt needs correction when its underlying evidence
+remains valid.
 
 | Change or result | Validation action |
 | --- | --- |
@@ -604,6 +610,15 @@ non-empty `recovery_actions` list. Severity is
 `semantic_review`. Diagnostics are explanatory and do not change
 `pass`/`fail`/`unproven`.
 
+The producer that detects a finding owns its diagnostic semantics and minimum
+recovery. The output boundary validates, preserves, deduplicates, and sorts
+producer diagnostics; it does not replace their context or recovery action.
+Existing `result`, `mechanical_findings`, `conflicts`, `checks`, component
+results, and recovery fields remain present for compatibility. Ordinary CLI
+JSON inputs that require objects return structured failures for unreadable
+bytes, invalid JSON, arrays, and scalar roots rather than raising an uncaught
+exception.
+
 ## Immutable Closeout Attestation
 
 Use:
@@ -706,6 +721,11 @@ The review is JSON in V1. It must include:
 - `findings`;
 - each finding must include the seven semantic finding fields plus `status`;
 - resolved findings require `resolution` and `resolution_evidence`.
+
+The four answers contain non-empty strings or non-empty string lists. Each
+finding field except `human_boundary` is a non-empty string;
+`human_boundary` is a JSON boolean. It is not automatically mapped to an
+adapter approval type.
 
 Closeout behavior:
 

@@ -266,17 +266,80 @@ def _validate_modern_validation_structure(
             "path": str(receipt_path),
         })
     commands = receipt.get("commands")
-    if not isinstance(commands, list) or not commands or any(
-        not isinstance(command, dict)
-        or not isinstance(command.get("command"), str)
-        or not command["command"]
-        or command.get("result") != "pass"
-        for command in commands
-    ):
+    if not isinstance(commands, list) or not commands:
         findings.append({
             "code": "validation-receipt-commands-invalid",
             "path": str(receipt_path),
+            "diagnostic": {
+                "severity": "blocking",
+                "category": "receipt_format",
+                "message": "Validation receipt commands must be a non-empty list.",
+                "recovery_actions": [
+                    "Provide a non-empty commands list in this validation receipt; retain all still-valid event evidence."
+                ],
+            },
         })
+        commands = []
+    for index, command in enumerate(commands):
+        if not isinstance(command, dict):
+            field = f"commands[{index}]"
+            findings.append({
+                "code": "validation-receipt-command-invalid",
+                "path": str(receipt_path),
+                "index": index,
+                "field": field,
+                "expected": "object",
+                "actual": type(command).__name__,
+                "diagnostic": {
+                    "severity": "blocking",
+                    "category": "receipt_format",
+                    "message": f"Validation receipt {field} must be an object.",
+                    "recovery_actions": [
+                        f"Correct only {field} in this validation receipt; retain all still-valid event evidence."
+                    ],
+                },
+            })
+            continue
+        command_value = command.get("command")
+        if not isinstance(command_value, str) or not command_value:
+            field = f"commands[{index}].command"
+            findings.append({
+                "code": "validation-receipt-command-field-invalid",
+                "path": str(receipt_path),
+                "index": index,
+                "field": field,
+                "expected": "non-empty string",
+                "actual": command_value,
+                "diagnostic": {
+                    "severity": "blocking",
+                    "category": "receipt_format",
+                    "message": f"Validation receipt {field} must be a non-empty string.",
+                    "recovery_actions": [
+                        f"Correct only {field} in this validation receipt; retain all still-valid event evidence."
+                    ],
+                },
+            })
+        result_value = command.get("result")
+        if result_value != "pass":
+            field = f"commands[{index}].result"
+            findings.append({
+                "code": "validation-receipt-command-result-invalid",
+                "path": str(receipt_path),
+                "index": index,
+                "field": field,
+                "expected": "pass",
+                "actual": result_value,
+                "diagnostic": {
+                    "severity": "blocking",
+                    "category": "receipt_format",
+                    "message": (
+                        f"Validation receipt {field} must be the exact value 'pass'."
+                    ),
+                    "recovery_actions": [
+                        f"Set only {field} to the exact value 'pass' after confirming the recorded command passed; retain all still-valid event evidence."
+                    ],
+                },
+            })
     for field in ("environment", "supported_claims", "unsupported_claims"):
         value = receipt.get(field)
         valid = (

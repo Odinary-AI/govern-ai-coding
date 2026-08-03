@@ -506,6 +506,34 @@ def validate_work_map_model(model: dict, config: dict) -> list[dict]:
     return checks
 
 
+def _check_diagnostic(item: dict) -> dict:
+    severity = {
+        "fail": "blocking",
+        "unproven": "unproven",
+        "warning": "warning",
+    }.get(item.get("severity"), "blocking")
+    recovery_actions = [
+        action
+        for action in item.get("recovery_actions", [])
+        if isinstance(action, str) and action
+    ]
+    if not recovery_actions:
+        recovery_actions = ["Correct this Work Map finding and rerun only work-map check."]
+    fields = {
+        key: value
+        for key, value in item.items()
+        if key not in {"code", "message", "recovery_actions", "severity"}
+    }
+    return {
+        "severity": severity,
+        "category": "blocking",
+        "code": str(item.get("code", "work-map-finding")),
+        "message": str(item.get("message") or recovery_actions[0]),
+        "fields": fields,
+        "recovery_actions": recovery_actions,
+    }
+
+
 def check_work_map(adapter: dict, workspace: Path) -> dict:
     model = load_work_map(adapter, workspace)
     checks = validate_work_map_model(model, adapter["work_map"])
@@ -521,6 +549,13 @@ def check_work_map(adapter: dict, workspace: Path) -> dict:
         },
         "target": None,
         "checks": checks,
+        "diagnostics": sorted(
+            (_check_diagnostic(item) for item in checks),
+            key=lambda item: (
+                item["severity"], item["category"], item["code"],
+                json.dumps(item["fields"], sort_keys=True),
+            ),
+        ),
         "proposed_fields": {},
         "patch": None,
         "recovery_actions": [
