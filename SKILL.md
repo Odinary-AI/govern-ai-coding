@@ -29,6 +29,17 @@ work-state, release, or historical authority. README edits remain ordinary
 governed-document changes unless an authority rule explicitly assigns another
 role.
 
+Before creating another current authority, resolve the existing authority for
+the exact `(question, scope)`. If it already answers that pair, update it rather
+than creating a peer. A new authority must answer a different normative
+question or close a named authority gap. README, `AGENTS.md`, generated views,
+and other navigation or auto-loaded files do not gain authority from visibility:
+a projection points back to its source and names a real discovery or execution
+consumer. Convenience, completeness, or possible future use is insufficient,
+and no project is required to create `AGENTS.md`. Treat this as a semantic
+review and human-authority boundary; mechanically block only defects that the
+checker can reliably prove.
+
 Read `references/adapter-schema.md` when creating or validating an adapter.
 Use `scripts/govern_ai_coding.py` for deterministic adapter, fixture, and
 live diagnostic checks.
@@ -95,6 +106,22 @@ eligible non-ignored untracked files. It reports ignored and excluded paths
 separately but does not treat them as event paths. Outside Git, `auto` is
 `unproven`; select `--change-source filesystem` explicitly when a filesystem
 baseline is intended.
+
+If editing or semantic review reveals an additional required path, do not run a
+fresh Impact on the edited tree and call it the pre-change baseline. Use
+`impact --extend-receipt ORIGINAL --changed-path PATH --write-receipt NEW` only
+when the preserved original receipt observed the path. Extension requires a
+newly adapter-bound, verified Git or explicit filesystem receipt. Git paths
+marked dirty at the original baseline and paths absent from that inventory
+remain `unproven`. The extended receipt preserves the original inventory,
+binds its parent digest and exact added observations, and never overwrites its
+parent. A manifest may adopt it only when it embeds that exact parent.
+
+If extension is unproven, preserve current edits. Either split the added path
+into a separate event from an isolated clean worktree, or reproduce a known
+clean pre-change boundary in an explicit filesystem copy and begin that event
+there. Do not discard edits or use destructive recovery. Unrelated test reruns
+cannot replace missing attribution evidence.
 
 For a medium or large event, use the optional versioned event manifest. It is
 generated evidence, never project authority. It keeps the event goal, baseline,
@@ -220,10 +247,19 @@ release-stage transition complete.
 
 For live Codex work, pass the declared changed paths, the documents authorized
 for the event, the Impact receipt, and a final-content freeze receipt. Closeout
-consumes a common Change Inventory, not raw Git semantics. Git is optional:
-filesystem snapshots provide the same event-isolation contract. Supplied or
-explicit path-only modes remain `unproven`. Fixture-only Closeout is for
-regression cases, not live task approval.
+consumes a common Change Inventory, not raw Git semantics. Both verified Git
+and explicitly selected filesystem inventories can support bounded before/after
+comparison, but they are not equivalent evidence: only Git supplies repository
+identity, HEAD/index/ignore context, and dirty-at-baseline attribution.
+Supplied or explicit path-only modes remain `unproven`. Fixture-only Closeout
+is for regression cases, not live task approval.
+
+Every receipt-backed Closeout reconciles actual event paths with the Impact
+plan. An unplanned actual path fails; unused planned paths warn. After Freeze,
+any changed frozen path still requires a new Freeze and rerun of the validation
+whose declared frozen inputs changed. Modern validation receipts whose own
+frozen inputs remain byte-identical can still be reused; Work Map validation
+continues to require an exact binding to the complete current Freeze.
 
 Create the freeze after all governed edits and semantic dispositions, then run
 the project's own validation:

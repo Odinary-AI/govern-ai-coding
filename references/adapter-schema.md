@@ -63,6 +63,14 @@ Rule ids must be unique. Ordered `paths` express precedence without copying
 facts. `triggers` route Impact only; they never authorize protected source,
 test, config, or generated writes.
 
+Authority admission remains semantic: resolve the current rule for the exact
+`(question, scope)` before adding another. A peer is justified only by a
+different normative question or a named authority gap. Navigation and
+auto-loaded projections such as README or `AGENTS.md` do not become authorities
+through visibility; a new projection points to its source and names its actual
+discovery or execution consumer. There is no universal `AGENTS.md` requirement
+and no static sufficiency gate for this judgment.
+
 ## Result
 
 Every run returns:
@@ -218,6 +226,12 @@ With `--workspace`, Impact emits a receipt:
 - verification capability;
 - recovery instructions.
 
+New receipts also bind the canonical adapter content and path. An additive
+`scope_extensions` entry records the canonical parent receipt digest, exact
+added paths, their preserved baseline observations, and either
+`git-baseline-with-dirty-state` or `explicit-filesystem-snapshot` semantics.
+The baseline inventory itself is unchanged.
+
 The receipt is derived evidence, not project authority. Pass it to Closeout with
 `--receipt` when you need filesystem or Git baseline isolation.
 
@@ -225,6 +239,14 @@ Impact rejects an empty scope as `unproven`. Inventory inputs fail mechanically
 when schemas, source kinds, entry types, existence/digest fields, rename fields,
 or receipt identity do not match the contract. Impact receipts carry
 `derived_evidence: true`, `generated: true`, and `project_authority: false`.
+
+`impact --extend-receipt ORIGINAL` is the only supported post-edit scope
+extension. It requires a verified, adapter-bound Git or explicit filesystem
+parent and permits only paths already observed in that parent. A Git entry
+marked dirty at baseline is rejected. The command never overwrites its parent;
+a manifest may adopt the derived receipt only when its embedded Impact has the
+same canonical digest. Missing observation or attribution remains `unproven`
+and cannot be compensated by unrelated validation.
 
 ## Final-Content Freeze
 

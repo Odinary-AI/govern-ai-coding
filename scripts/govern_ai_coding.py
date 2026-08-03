@@ -1702,7 +1702,10 @@ def evaluate_impact_path_reconciliation(
             "code": "impact-unplanned-actual-path",
             "path": path,
             "recovery_actions": [
-                "Run a new Impact including this path before further governed edits."
+                "If the preserved original Impact observed this path cleanly, use "
+                "impact --extend-receipt with that receipt before Closeout. Otherwise "
+                "preserve current edits and split the path into a separate event from "
+                "an isolated clean worktree or known clean filesystem copy."
             ],
         }
         for path in sorted(actual - planned)
@@ -1716,6 +1719,177 @@ def evaluate_impact_path_reconciliation(
         for path in sorted(planned - actual)
     ]
     return findings, warnings
+
+
+def analyze_impact_scope(adapter: dict, changed_paths: list[str]) -> dict:
+    rules = safe_rule_list(adapter)
+    boundary_rules = safe_section(adapter, "boundaries")
+    protected_patterns = boundary_rules.get("protected", [])
+    excluded_patterns = boundary_rules.get("excluded", [])
+    affected: list[str] = []
+    protected: list[str] = []
+    excluded: list[str] = []
+
+    for changed in changed_paths:
+        for pattern in protected_patterns:
+            if path_matches(changed, pattern):
+                protected.append(changed)
+        for pattern in excluded_patterns:
+            if path_matches(changed, pattern):
+                excluded.append(changed)
+        for rule in rules:
+            if any(
+                path_matches(changed, path) or path_matches(path, changed)
+                for path in rule.get("paths", [])
+            ):
+                affected.append(rule["id"])
+            if any(
+                path_matches(changed, trigger)
+                for trigger in rule.get("triggers", []) or []
+            ):
+                affected.append(rule["id"])
+
+    affected = sorted(set(affected))
+    human: list[str] = []
+    approval_requirements: list[dict] = []
+    for rule in rules:
+        if rule.get("id") not in affected:
+            continue
+        approval_types = list(rule.get("human_approval_types", []) or [])
+        if rule.get("human") and not approval_types:
+            resolved_type, _, _ = resolve_rule_approval_type(adapter, rule)
+            approval_types = [resolved_type] if resolved_type else []
+        human.extend(approval_types)
+        for approval_type in approval_types:
+            approval_requirements.append({
+                "authority_rule_id": rule.get("id"),
+                "object": rule.get("question"),
+                "approval_type": approval_type,
+                "scope": rule.get("scope"),
+                "target_paths": sorted(set(rule.get("paths", []))),
+                "does_not_approve": {
+                    "approval_types": sorted(
+                        set(adapter.get("human_approval", [])) - {approval_type}
+                    ),
+                    "protected_paths": sorted(set(protected_patterns)),
+                    "excluded_paths": sorted(set(excluded_patterns)),
+                },
+            })
+    return {
+        "affected_authorities": affected,
+        "candidate_authority_paths": sorted({
+            path
+            for rule in rules
+            if rule.get("id") in affected
+            for path in rule.get("paths", [])
+        }),
+        "protected_paths": sorted(set(protected)),
+        "excluded_paths": sorted(set(excluded)),
+        "human_approval_required": sorted(set(human)),
+        "approval_requirements": sorted(
+            approval_requirements,
+            key=lambda item: (
+                item["authority_rule_id"],
+                item["approval_type"],
+            ),
+        ),
+    }
+
+
+def impact_extension_payload(
+    *,
+    adapter: dict,
+    adapter_path: Path,
+    workspace: Path,
+    parent_receipt: dict,
+    added_paths: list[str],
+) -> tuple[dict | None, list[dict], list[str], list[str]]:
+    findings = validate_impact_receipt(parent_receipt, adapter, workspace)
+    unverified: list[str] = []
+    recovery_actions: list[str] = []
+    expected_binding = {
+        "path": str(adapter_path.resolve()),
+        "digest": canonical_json_digest(adapter),
+    }
+    if parent_receipt.get("adapter_binding") != expected_binding:
+        unverified.append("impact-extension-parent-adapter-unbound")
+        recovery_actions.append(
+            "Use an original Impact receipt created by this adapter version; "
+            "otherwise return to a clean isolated worktree or known clean filesystem "
+            "copy and begin a separate governed event without discarding current edits."
+        )
+
+    source = parent_receipt.get("inventory_source", {})
+    baseline = parent_receipt.get("baseline_inventory", {})
+    source_kind = source.get("kind")
+    source_verified = source.get("verified") is True
+    baseline_verified = baseline.get("source", {}).get("verified") is True
+    if source_kind not in {"git", "filesystem"} or not (
+        source_verified and baseline_verified
+    ):
+        unverified.append("impact-extension-parent-baseline-unverified")
+        recovery_actions.append(
+            "Use the verified original Git or explicit filesystem Impact receipt. "
+            "If none exists, preserve current edits and establish a separate event from "
+            "an isolated clean worktree or known clean filesystem copy."
+        )
+
+    observations: list[dict] = []
+    baseline_entries = inventory_map(baseline)
+    for path in added_paths:
+        entry = baseline_entries.get(path)
+        if not isinstance(entry, dict) or entry.get("verified") is not True:
+            unverified.append("impact-extension-path-not-observed")
+            recovery_actions.append(
+                f"The original baseline did not observe {path}. Preserve current edits; "
+                "either split that path into a separate event from an isolated clean "
+                "boundary, or reproduce the original clean boundary in a known clean "
+                "filesystem copy and rerun Impact there."
+            )
+            continue
+        if source_kind == "git" and (
+            entry.get("metadata", {}).get("dirty_at_baseline") is True
+        ):
+            unverified.append("impact-extension-path-dirty-at-baseline")
+            recovery_actions.append(
+                f"The original Git baseline already marked {path} dirty, so this event "
+                "cannot claim its attribution. Preserve the edit and split it into a "
+                "separate event at a demonstrably clean boundary."
+            )
+            continue
+        observations.append(entry)
+
+    if findings or unverified:
+        return None, findings, sorted(set(unverified)), list(dict.fromkeys(recovery_actions))
+
+    planned_paths = sorted(set(parent_receipt["planned_paths"]) | set(added_paths))
+    scope = analyze_impact_scope(adapter, planned_paths)
+    extended = json.loads(json.dumps(parent_receipt))
+    extended.update({
+        "planned_paths": planned_paths,
+        "affected_authorities": scope["affected_authorities"],
+        "candidate_authority_paths": scope["candidate_authority_paths"],
+        "protected_paths": scope["protected_paths"],
+        "excluded_paths": scope["excluded_paths"],
+        "human_approval_required": scope["human_approval_required"],
+        "approval_requirements": scope["approval_requirements"],
+    })
+    extensions = list(extended.get("scope_extensions", []))
+    extensions.append({
+        "parent_receipt_digest": canonical_json_digest(parent_receipt),
+        "added_paths": added_paths,
+        "baseline_observations": sorted(
+            observations,
+            key=lambda item: item["path"],
+        ),
+        "source_semantics": (
+            "git-baseline-with-dirty-state"
+            if source_kind == "git"
+            else "explicit-filesystem-snapshot"
+        ),
+    })
+    extended["scope_extensions"] = extensions
+    return extended, [], [], []
 
 
 def impact_command(args: argparse.Namespace) -> None:
@@ -1757,64 +1931,144 @@ def impact_command(args: argparse.Namespace) -> None:
         })
         return
 
-    rules = safe_rule_list(adapter)
-    boundary_rules = safe_section(adapter, "boundaries")
-    protected_patterns = boundary_rules.get("protected", [])
-    excluded_patterns = boundary_rules.get("excluded", [])
-    affected = []
-    protected = []
-    excluded = []
+    scope = analyze_impact_scope(adapter, changed_paths)
+    affected = scope["affected_authorities"]
+    candidate_authority_paths = scope["candidate_authority_paths"]
+    protected = scope["protected_paths"]
+    excluded = scope["excluded_paths"]
+    human = scope["human_approval_required"]
+    approval_requirements = scope["approval_requirements"]
 
-    for changed in changed_paths:
-        for pattern in protected_patterns:
-            if path_matches(changed, pattern):
-                protected.append(changed)
-        for pattern in excluded_patterns:
-            if path_matches(changed, pattern):
-                excluded.append(changed)
-        for rule in rules:
-            if any(path_matches(changed, path) or path_matches(path, changed) for path in rule.get("paths", [])):
-                affected.append(rule["id"])
-            if any(path_matches(changed, trigger) for trigger in rule.get("triggers", []) or []):
-                affected.append(rule["id"])
-
-    affected = sorted(set(affected))
-    human = []
-    approval_requirements = []
-    for rule in rules:
-        if rule.get("id") not in affected:
-            continue
-        approval_types = list(rule.get("human_approval_types", []) or [])
-        if rule.get("human") and not approval_types:
-            resolved_type, _, _ = resolve_rule_approval_type(adapter, rule)
-            approval_types = [resolved_type] if resolved_type else []
-        human.extend(approval_types)
-        for approval_type in approval_types:
-            approval_requirements.append({
-                "authority_rule_id": rule.get("id"),
-                "object": rule.get("question"),
-                "approval_type": approval_type,
-                "scope": rule.get("scope"),
-                "target_paths": sorted(set(rule.get("paths", []))),
-                "does_not_approve": {
-                    "approval_types": sorted(
-                        set(adapter.get("human_approval", [])) - {approval_type}
-                    ),
-                    "protected_paths": sorted(set(protected_patterns)),
-                    "excluded_paths": sorted(set(excluded_patterns)),
-                },
+    if args.extend_receipt:
+        if not args.workspace:
+            emit({
+                "result": "fail",
+                "coverage": {"unverified": []},
+                "impact": {"changed_paths": changed_paths},
+                "receipt": None,
+                "mechanical_findings": [{
+                    "code": "impact-extension-workspace-required",
+                }],
+                "semantic_findings": [],
+                "human_approval_required": [],
+                "recovery": "Supply the workspace bound to the original Impact receipt.",
+                "recovery_actions": [],
             })
-    human = sorted(set(human))
-    approval_requirements = sorted(
-        approval_requirements,
-        key=lambda item: (item["authority_rule_id"], item["approval_type"]),
-    )
-    candidate_authority_paths = sorted({
-        path
-        for rule in rules
-        if rule.get("id") in affected
-        for path in rule.get("paths", [])
-    })
+            return
+        workspace = Path(args.workspace)
+        try:
+            parent_payload = load_json(Path(args.extend_receipt))
+        except OSError as exc:
+            emit({
+                "result": "fail",
+                "coverage": {"unverified": []},
+                "impact": {"changed_paths": changed_paths},
+                "receipt": None,
+                "mechanical_findings": [{
+                    "code": "impact-extension-parent-unreadable",
+                    "path": args.extend_receipt,
+                    "message": str(exc),
+                }],
+                "semantic_findings": [],
+                "human_approval_required": [],
+                "recovery": "Restore readable original Impact evidence and retry.",
+                "recovery_actions": [
+                    "Do not replace the original receipt with a new post-edit baseline."
+                ],
+            })
+            return
+        parent_receipt, extract_findings = extract_impact_receipt(parent_payload)
+        if parent_receipt is None:
+            parent_receipt = {}
+        added_paths = sorted(
+            set(changed_paths) - set(parent_receipt.get("planned_paths", []))
+        )
+        receipt, extension_findings, extension_unverified, recovery_actions = (
+            impact_extension_payload(
+                adapter=adapter,
+                adapter_path=Path(args.adapter),
+                workspace=workspace,
+                parent_receipt=parent_receipt,
+                added_paths=added_paths,
+            )
+        )
+        extension_findings = extract_findings + extension_findings
+        extension_scope = (
+            analyze_impact_scope(adapter, receipt["planned_paths"])
+            if receipt is not None
+            else scope
+        )
+        result = (
+            "fail"
+            if path_findings or manifest_findings or extension_findings
+            else "unproven"
+            if extension_unverified
+            or extension_scope["human_approval_required"]
+            or extension_scope["protected_paths"]
+            or extension_scope["excluded_paths"]
+            else "pass"
+        )
+        if manifest is not None:
+            embedded_parent = manifest.get("receipts", {}).get("impact")
+            if (
+                not isinstance(embedded_parent, dict)
+                or canonical_json_digest(embedded_parent)
+                != canonical_json_digest(parent_receipt)
+            ):
+                extension_findings.append({
+                    "code": "event-manifest-impact-parent-mismatch",
+                    "message": (
+                        "The event manifest must embed the exact parent Impact receipt "
+                        "before it can adopt an extension."
+                    ),
+                })
+                result = "fail"
+        output_path = None
+        if args.write_receipt and receipt is not None and result != "fail":
+            output_path, write_findings = write_receipt_file(
+                receipt,
+                args.write_receipt,
+                workspace,
+                adapter,
+                overwrite=False,
+            )
+            if write_findings:
+                extension_findings.extend(write_findings)
+                result = "fail"
+        if manifest is not None and receipt is not None and result != "fail":
+            manifest["scope"]["planned_paths"] = receipt["planned_paths"]
+            manifest["receipts"]["impact"] = receipt
+            write_findings = write_event_manifest(
+                manifest,
+                args.event_manifest,
+                workspace,
+                adapter,
+            )
+            if write_findings:
+                extension_findings.extend(write_findings)
+                result = "fail"
+        emit({
+            "result": result,
+            "coverage": {"unverified": extension_unverified},
+            "impact": {
+                "changed_paths": receipt["planned_paths"] if receipt else changed_paths,
+                **extension_scope,
+                "evidence_entrypoints": safe_section(adapter, "entrypoints").get("evidence", []),
+            },
+            "receipt": receipt,
+            "mechanical_findings": path_findings + manifest_findings + extension_findings,
+            "semantic_findings": [],
+            "human_approval_required": extension_scope["human_approval_required"],
+            "warnings": adapter_result.get("warnings", []),
+            "recovery": (
+                "Impact scope extension completed from the preserved original baseline."
+                if result == "pass"
+                else "The original baseline cannot prove this scope extension."
+            ),
+            "recovery_actions": recovery_actions,
+            "receipt_output": output_path,
+        })
+        return
     receipt = None
     receipt_findings = []
     impact_unverified = ["empty-impact-scope"] if not changed_paths else []
@@ -1894,6 +2148,10 @@ def impact_command(args: argparse.Namespace) -> None:
             "schema": "govern-ai-coding.receipt.v1",
             "schema_version": "1",
             "adapter": {"project": adapter.get("project"), "schema_version": adapter.get("schema_version")},
+            "adapter_binding": {
+                "path": str(Path(args.adapter).resolve()),
+                "digest": canonical_json_digest(adapter),
+            },
             "workspace": {"path": str(workspace.resolve())},
             "inventory_source": {
                 "kind": source,
@@ -2197,6 +2455,8 @@ def write_receipt_file(
     output_path: str | None,
     workspace: Path,
     adapter: dict,
+    *,
+    overwrite: bool = True,
 ) -> tuple[str | None, list[dict]]:
     if not output_path:
         return None, []
@@ -2204,7 +2464,7 @@ def write_receipt_file(
     if findings or destination is None:
         return None, findings
     try:
-        atomic_write_json(receipt, destination)
+        atomic_write_json(receipt, destination, overwrite=overwrite)
     except OSError as exc:
         return None, [{
             "code": "receipt-write-failed",
@@ -5990,11 +6250,7 @@ def live_closeout(
         if args is not None
         else None
     )
-    if (
-        receipt is not None
-        and isinstance(event_manifest, dict)
-        and event_manifest.get("work_map_binding") is not None
-    ):
+    if receipt is not None:
         reconciliation_findings, reconciliation_warnings = (
             evaluate_impact_path_reconciliation(receipt, event_paths)
         )
@@ -7185,6 +7441,10 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
     )
     impact.add_argument("--write-receipt")
+    impact.add_argument(
+        "--extend-receipt",
+        help="extend scope only from paths observed by a preserved original Impact receipt",
+    )
     impact.add_argument("--event-manifest")
     impact.add_argument("--paths-from", action="append", default=[])
     impact.add_argument("--baseline-ref")

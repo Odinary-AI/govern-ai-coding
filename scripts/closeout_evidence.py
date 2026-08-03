@@ -377,6 +377,35 @@ def _validate_freeze_bound_validation(
     return findings
 
 
+def _validate_validation_input_content(
+    receipt: dict,
+    receipt_path: Path,
+    workspace: Path,
+) -> list[dict]:
+    if validation_input_projection(receipt, receipt_path) is None:
+        return []
+    findings: list[dict] = []
+    for entry in receipt["frozen_paths"]:
+        path = entry["path"]
+        expected_digest = entry.get("digest")
+        target = workspace / path
+        matches = (
+            target.is_file()
+            and isinstance(expected_digest, str)
+            and _file_digest(target) == expected_digest
+        ) or (
+            not target.exists()
+            and expected_digest is None
+        )
+        if not matches:
+            findings.append({
+                "code": "validation-receipt-frozen-content-mismatch",
+                "path": path,
+                "receipt": str(receipt_path),
+            })
+    return findings
+
+
 def collect_validation_evidence(
     receipt_paths: list[str],
     workspace: Path,
@@ -423,6 +452,10 @@ def collect_validation_evidence(
             receipt_findings = _validate_modern_validation_structure(
                 receipt, target,
             )
+            if not receipt_findings:
+                receipt_findings.extend(_validate_validation_input_content(
+                    receipt, target, workspace,
+                ))
         findings.extend(receipt_findings)
         if receipt_findings:
             continue
