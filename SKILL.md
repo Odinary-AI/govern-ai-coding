@@ -1,6 +1,6 @@
 ---
 name: govern-ai-coding
-description: Use when AI-assisted development in a complex system may change project facts, plans, decisions, evidence, release claims, authority, or historical interpretation.
+description: Use when a workspace has an explicit GAC governance contract and the requested change touches a mapped authority, protected path, governed decision, historical interpretation, or release authorization; also use when the user explicitly requests GAC setup, adapter repair, diagnosis, execution, or closeout, or when an active governed event must resume. Do not use merely because work involves plans, documentation, tests, evidence, multiple files, releases, another Skill, or a complex codebase. Do not bootstrap governance artifacts for an ordinary coding task.
 ---
 
 # Govern AI Coding
@@ -17,6 +17,36 @@ ordered set of sources.
 
 Do not treat Skill output as project authority. Findings are evidence until the
 durable conclusion is written back into mapped project documents.
+
+## Applicability Gate
+
+Run this lightweight gate immediately after loading the Skill and before
+creating an adapter, governance document, receipt, or extra validation:
+
+1. Applicability is established when the user explicitly requests GAC setup,
+   adapter creation or repair, diagnosis, execution, or closeout, or when a
+   verifiably active governed event must resume Freeze, validation, or
+   Closeout.
+2. Otherwise, locate an existing valid adapter. Do not create an adapter as a
+   discovery fallback.
+3. When relying on the adapter, compare the exact intended change paths and
+   governed question with its declared rules. At least one actual boundary
+   must be present: a mapped authority rule, protected path, required human
+   approval, governed decision, historical interpretation, or governed
+   release authorization. Adapter existence by itself is insufficient.
+4. If neither branch applies, **Stop using this Skill**. Do not run Impact, do
+   not create a receipt, adapter, governance decision file, or extra gate, and
+   do not add validation beyond the repository's ordinary requirements.
+5. The words release, plan, evidence, decision, history, or authority, the
+   number of files, and codebase complexity are not applicability evidence.
+   Using another Skill is not a GAC trigger.
+6. ASE, Skill Creator, and GAC each require independent applicability. When ASE
+   and GAC are both used, keep their findings and lifecycle obligations
+   separate.
+
+For explicit adapter setup or repair, perform only that requested adapter work
+until the adapter is valid. Before treating later development as a governed
+event, rerun this gate against the valid adapter and the event's exact paths.
 
 ## Inputs
 
