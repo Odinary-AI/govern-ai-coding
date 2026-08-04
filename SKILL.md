@@ -317,6 +317,14 @@ declared in the project adapter and mapped by the affected authority rule's
 protected-path approval never satisfies a semantic approval. The checker
 verifies the binding, not the truth or identity of the human decision.
 
+One evidence document may contain several approval blocks. Each exact
+`Approval type:` starts an independent record; one matching record must carry
+all four non-empty fields and its own `Object` must cover every required
+target as a complete path token. Closeout never combines fields or target
+coverage across blocks. If no record succeeds, diagnostics distinguish an
+unrecorded type, an incomplete block, uncovered targets, and a structurally
+ambiguous block.
+
 Use `--authorized-path` for paths this event may modify. Path authorization
 permits bytes to change; it never approves product, architecture, release, or
 historical meaning. `--authorized-doc` remains a compatibility alias and emits

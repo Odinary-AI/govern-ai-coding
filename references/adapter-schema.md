@@ -471,6 +471,29 @@ The binding is valid only when:
 - the evidence contains non-empty `Approval type:`, `Object:`, `Scope:`, and
   `Does not approve:` fields, with the exact type and affected object.
 
+An evidence document may contain multiple approval blocks. Each exact
+`Approval type:` field starts a separate record. A binding succeeds when any
+one record of the exact bound type independently contains all four fields and
+its own `Object` covers every target as a complete path token. A target embedded
+inside a longer path-like value does not count. Records are evaluated in
+document order and are never combined to supply fields or target coverage.
+Once a record is complete, later ordinary `Object:` or `Scope:` text cannot
+overwrite it.
+
+Fail-closed evidence diagnostics are specific:
+
+- `human-approval-type-not-recorded`: no block records the exact bound type;
+- `human-approval-block-incomplete`: matching blocks exist but none contains
+  all four non-empty fields;
+- `human-approval-target-not-covered`: complete matching blocks exist but no
+  single `Object` covers every target;
+- `human-approval-block-ambiguous`: no valid block exists and a matching
+  unsealed block repeats a protocol field.
+
+These codes replace the earlier catch-all
+`human-approval-scope-mismatch` for approval evidence evaluation. Adapter
+schema version and `--human-approval TYPE=EVIDENCE` syntax are unchanged.
+
 Valid bindings appear in `closeout.verified_human_approvals`. They can satisfy
 only the exact mapped type. Architecture approval cannot satisfy release
 approval, technical acceptance cannot become release approval, and a protected

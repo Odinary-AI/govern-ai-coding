@@ -5900,24 +5900,145 @@ def path_scope_tokens(path: str) -> set[str]:
     return {word for word in words if len(word) >= 3 and not word.isdigit()}
 
 
-def text_records_human_approval(text: str, approval_type: str, targets: list[str]) -> bool:
-    fields: dict[str, str] = {}
+HUMAN_APPROVAL_FIELDS = (
+    "approval type",
+    "object",
+    "scope",
+    "does not approve",
+)
+
+
+def parse_human_approval_blocks(text: str) -> list[dict]:
+    records: list[dict] = []
+    current: dict | None = None
     for line in text.splitlines():
         if ":" not in line:
             continue
         key, value = line.split(":", 1)
-        fields[key.strip().lower()] = value.strip()
-    required = {"approval type", "object", "scope", "does not approve"}
-    if not required.issubset(fields) or any(not fields[key] for key in required):
-        return False
-    recorded_type = fields["approval type"].rstrip(". ").casefold()
-    if recorded_type != approval_type.rstrip(". ").casefold():
-        return False
-    object_scope = fields["object"]
-    for target in targets:
-        if target not in object_scope and target not in text:
-            return False
-    return True
+        field = key.strip().lower()
+        field_value = value.strip()
+        if field == "approval type":
+            if current is not None:
+                records.append(current)
+            current = {
+                "fields": {field: field_value},
+                "ambiguous_fields": [],
+                "sealed": False,
+            }
+            continue
+        if (
+            current is None
+            or current["sealed"]
+            or field not in HUMAN_APPROVAL_FIELDS
+        ):
+            continue
+        if field in current["fields"]:
+            if field not in current["ambiguous_fields"]:
+                current["ambiguous_fields"].append(field)
+            continue
+        current["fields"][field] = field_value
+        current["sealed"] = all(
+            current["fields"].get(required_field)
+            for required_field in HUMAN_APPROVAL_FIELDS
+        )
+    if current is not None:
+        records.append(current)
+    return records
+
+
+def human_approval_evidence_finding(
+    code: str,
+    message: str,
+    recovery: str,
+    **fields: object,
+) -> dict:
+    return {
+        "code": code,
+        **fields,
+        "diagnostic": {
+            "severity": "blocking",
+            "category": "approval_evidence",
+            "message": message,
+            "recovery_actions": [recovery],
+        },
+    }
+
+
+def evaluate_human_approval_evidence(
+    text: str,
+    approval_type: str,
+    targets: list[str],
+) -> dict | None:
+    normalized_type = approval_type.rstrip(". ").casefold()
+    candidates = [
+        record
+        for record in parse_human_approval_blocks(text)
+        if record["fields"].get("approval type", "").rstrip(". ").casefold()
+        == normalized_type
+    ]
+    if not candidates:
+        return human_approval_evidence_finding(
+            "human-approval-type-not-recorded",
+            "No approval block records the exact bound approval type.",
+            "Add one complete block for the exact bound approval type to the in-event evidence, then rerun Closeout.",
+            type=approval_type,
+            targets=targets,
+        )
+
+    complete = [
+        record
+        for record in candidates
+        if record["sealed"] and not record["ambiguous_fields"]
+    ]
+    for record in complete:
+        object_scope = record["fields"]["object"]
+        if all(
+            re.search(
+                rf"(?<![A-Za-z0-9_./-]){re.escape(target)}"
+                rf"(?![A-Za-z0-9_/-]|\.[A-Za-z0-9_/-])",
+                object_scope,
+            )
+            for target in targets
+        ):
+            return None
+
+    ambiguous_fields = sorted({
+        field
+        for record in candidates
+        for field in record["ambiguous_fields"]
+    })
+    if ambiguous_fields:
+        return human_approval_evidence_finding(
+            "human-approval-block-ambiguous",
+            "A matching approval block contains repeated protocol fields.",
+            "Remove or disambiguate repeated fields within one matching approval block, then rerun Closeout.",
+            type=approval_type,
+            targets=targets,
+            ambiguous_fields=ambiguous_fields,
+        )
+    if complete:
+        return human_approval_evidence_finding(
+            "human-approval-target-not-covered",
+            "No complete matching approval block covers every target in its own Object field.",
+            "Update one matching block's Object field to cover every required target, then rerun Closeout.",
+            type=approval_type,
+            targets=targets,
+        )
+
+    missing_fields = sorted({
+        field
+        for record in candidates
+        for field in HUMAN_APPROVAL_FIELDS
+        if not record["fields"].get(field)
+    })
+    return human_approval_evidence_finding(
+        "human-approval-block-incomplete",
+        "No matching approval block contains all required non-empty fields.",
+        "Complete one matching approval block without borrowing fields from another block, then rerun Closeout.",
+        type=approval_type,
+        targets=targets,
+        missing_fields=missing_fields,
+    )
 
 
 def text_records_archive_approval(
@@ -6622,17 +6743,17 @@ def live_closeout(
                 "type": approval_type,
                 "evidence": evidence,
             })
-        elif evidence_text and not text_records_human_approval(
-            evidence_text,
-            approval_type,
-            approval_targets,
-        ):
-            mechanical.append({
-                "code": "human-approval-scope-mismatch",
-                "type": approval_type,
-                "evidence": evidence,
-                "targets": approval_targets,
-            })
+        elif evidence_text:
+            evidence_finding = evaluate_human_approval_evidence(
+                evidence_text,
+                approval_type,
+                approval_targets,
+            )
+            if evidence_finding is not None:
+                mechanical.append({
+                    **evidence_finding,
+                    "evidence": evidence,
+                })
 
         if len(mechanical) == before:
             accepted = {
