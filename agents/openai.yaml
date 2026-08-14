@@ -1,4 +1,4 @@
 interface:
   display_name: "Govern AI Coding"
-  short_description: "Govern AI coding with required project navigation."
-  default_prompt: "Use $govern-ai-coding to validate the root README navigation entrypoint, govern this change, analyze archive candidates read-only, or execute an exactly authorized archive move."
+  short_description: "Govern project changes as reviewable batches."
+  default_prompt: "Use $govern-ai-coding to decide whether GAC applies and govern a batch through Impact and finalization."

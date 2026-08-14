@@ -6514,8 +6514,9 @@ def live_closeout(
     protected_approval_bindings: list[str],
     human_approval_bindings: list[str],
     args: argparse.Namespace | None = None,
+    adapter_validation: dict | None = None,
 ) -> dict:
-    adapter_result = validate_live_adapter(adapter, workspace)
+    adapter_result = adapter_validation or validate_live_adapter(adapter, workspace)
     mechanical = list(adapter_result["mechanical_findings"])
     path_warnings: list[dict] = []
     human_required = []
@@ -7627,6 +7628,7 @@ def closeout_command(args: argparse.Namespace) -> None:
             args.protected_approval,
             args.human_approval,
             args,
+            adapter_validation=live_validation,
         )
         payload["warnings"] = list(payload.get("warnings", [])) + compatibility_warnings
         work_map_observation, work_map_findings = evaluate_work_map_closeout(
