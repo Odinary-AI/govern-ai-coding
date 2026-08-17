@@ -1,0 +1,23 @@
+{
+  "schema": "govern-ai-coding.validation-facts.v1",
+  "result": "pass",
+  "input_classes": [
+    "paths"
+  ],
+  "commands": [
+    {
+      "command": "python3 -m unittest",
+      "result": "pass",
+      "observed": "project-selected validation evidence"
+    }
+  ],
+  "environment": {
+    "runtime": "Python 3.12"
+  },
+  "supported_claims": [
+    "bounded implementation behavior"
+  ],
+  "unsupported_claims": [
+    "release readiness"
+  ]
+}

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from contextvars import ContextVar
 import hashlib
 import importlib.util
 import json
@@ -19,6 +20,11 @@ from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 try:
+    import fcntl
+except ImportError:  # pragma: no cover - exercised through simulated platform imports
+    fcntl = None
+
+try:
     from controlled_archive import (
         AMENDMENT_SCHEMA,
         EXECUTION_GRANT_SCHEMA,
@@ -26,8 +32,9 @@ try:
         TASK_GRANT_SCHEMA,
         archive_authorization_lifecycle,
         build_archive_preflight,
-        canonical_json_digest as archive_protocol_digest,
+        canonical_archive_v1_digest,
         classify_archive_references,
+        compact_archive_task_execution_results,
         global_archive_preflight,
         normalize_archive_result,
         reconcile_archive_task,
@@ -60,9 +67,14 @@ except ModuleNotFoundError:
         _archive_protocol_module.archive_authorization_lifecycle
     )
     build_archive_preflight = _archive_protocol_module.build_archive_preflight
-    archive_protocol_digest = _archive_protocol_module.canonical_json_digest
+    canonical_archive_v1_digest = (
+        _archive_protocol_module.canonical_archive_v1_digest
+    )
     classify_archive_references = (
         _archive_protocol_module.classify_archive_references
+    )
+    compact_archive_task_execution_results = (
+        _archive_protocol_module.compact_archive_task_execution_results
     )
     global_archive_preflight = _archive_protocol_module.global_archive_preflight
     normalize_archive_result = _archive_protocol_module.normalize_archive_result
@@ -89,6 +101,10 @@ except ModuleNotFoundError:
         _archive_protocol_module.validate_receipt_grant_binding
     )
     validate_reference_rules = _archive_protocol_module.validate_reference_rules
+
+# Compatibility name retained for callers that already import the main CLI as a
+# module. New protocol code uses the versioned owner name above.
+archive_protocol_digest = canonical_archive_v1_digest
 
 try:
     from work_map import (
@@ -153,8 +169,15 @@ except ModuleNotFoundError:
 try:
     from closeout_evidence import (
         CLOSEOUT_ATTESTATION_SCHEMA,
+        bind_closeout_attestation,
         build_closeout_attestation as build_evidence_attestation,
-        collect_validation_evidence,
+        build_validation_receipt as build_evidence_validation_receipt,
+        canonical_evidence_v1_digest,
+        collect_validation_evidence_for_profile,
+        current_closeout_attempt,
+        parse_closeout_attestation,
+        validate_event_manifest_closeout_ledger,
+        validate_validation_receipt_for_profile,
     )
 except ModuleNotFoundError:
     _closeout_evidence_path = Path(__file__).with_name("closeout_evidence.py")
@@ -170,11 +193,32 @@ except ModuleNotFoundError:
     CLOSEOUT_ATTESTATION_SCHEMA = (
         _closeout_evidence_module.CLOSEOUT_ATTESTATION_SCHEMA
     )
+    bind_closeout_attestation = (
+        _closeout_evidence_module.bind_closeout_attestation
+    )
     build_evidence_attestation = (
         _closeout_evidence_module.build_closeout_attestation
     )
-    collect_validation_evidence = (
-        _closeout_evidence_module.collect_validation_evidence
+    build_evidence_validation_receipt = (
+        _closeout_evidence_module.build_validation_receipt
+    )
+    canonical_evidence_v1_digest = (
+        _closeout_evidence_module.canonical_evidence_v1_digest
+    )
+    collect_validation_evidence_for_profile = (
+        _closeout_evidence_module.collect_validation_evidence_for_profile
+    )
+    current_closeout_attempt = (
+        _closeout_evidence_module.current_closeout_attempt
+    )
+    parse_closeout_attestation = (
+        _closeout_evidence_module.parse_closeout_attestation
+    )
+    validate_event_manifest_closeout_ledger = (
+        _closeout_evidence_module.validate_event_manifest_closeout_ledger
+    )
+    validate_validation_receipt_for_profile = (
+        _closeout_evidence_module.validate_validation_receipt_for_profile
     )
 
 
@@ -183,6 +227,8 @@ INVENTORY_SCHEMA = "govern-ai-coding.inventory.v1"
 IMPACT_RECEIPT_SCHEMA = "govern-ai-coding.receipt.v1"
 FREEZE_RECEIPT_SCHEMA = "govern-ai-coding.freeze-receipt.v1"
 EVENT_MANIFEST_SCHEMA = "govern-ai-coding.event-manifest.v1"
+EVENT_MANIFEST_V2_SCHEMA = "govern-ai-coding.event-manifest.v2"
+AUDIT_EVENT_RESULT_SCHEMA = "govern-ai-coding.audit-event-result.v1"
 ARCHIVE_REQUEST_SCHEMA = "govern-ai-coding.archive-request.v1"
 ARCHIVE_RECEIPT_SCHEMA = "govern-ai-coding.archive-receipt.v1"
 ADAPTER_SCHEMA_VERSION = "2"
@@ -204,6 +250,39 @@ DEFAULT_INVENTORY_EXCLUDE_COMPONENTS = {
     for pattern in DEFAULT_INVENTORY_EXCLUDES
     if "/" not in pattern.rstrip("/")
 }
+SKILL_ROOT = Path(__file__).resolve().parent.parent
+PACKAGE_DIGEST_EXCLUDED_NAMES = {"__pycache__", ".DS_Store"}
+
+
+def read_skill_version() -> str:
+    version = (SKILL_ROOT / "VERSION").read_text(encoding="utf-8").strip()
+    if not version:
+        raise ValueError("Skill VERSION is empty")
+    return version
+
+
+def skill_package_digest() -> str:
+    digest = hashlib.sha256()
+    for path in sorted(SKILL_ROOT.rglob("*")):
+        relative = path.relative_to(SKILL_ROOT)
+        if (
+            not path.is_file()
+            or path.is_symlink()
+            or any(part in PACKAGE_DIGEST_EXCLUDED_NAMES for part in relative.parts)
+            or path.suffix == ".pyc"
+        ):
+            continue
+        encoded_path = relative.as_posix().encode("utf-8")
+        content = path.read_bytes()
+        digest.update(len(encoded_path).to_bytes(8, "big"))
+        digest.update(encoded_path)
+        digest.update(len(content).to_bytes(8, "big"))
+        digest.update(content)
+    return digest.hexdigest()
+
+
+def runtime_identity() -> str:
+    return f"govern-ai-coding {read_skill_version()} sha256:{skill_package_digest()}"
 
 
 def json_type_name(value: object) -> str:
@@ -299,8 +378,88 @@ def load_json_or_missing(path: Path) -> tuple[dict | None, dict | None]:
     }
 
 
-def emit(payload: dict) -> None:
-    print(json.dumps(add_structured_diagnostics(payload), indent=2, sort_keys=True))
+RESULT_EXIT_CODES = {"pass": 0, "fail": 1, "unproven": 2}
+COMPACT_RESULT_SCHEMA = "govern-ai-coding.compact-result.v1"
+_COMPACT_OUTPUT = ContextVar("govern_ai_coding_compact_output", default=False)
+
+
+def result_exit_code(payload: dict) -> int:
+    result = payload.get("result", payload.get("verdict"))
+    return RESULT_EXIT_CODES.get(result, 3)
+
+
+def compact_result_payload(
+    payload: dict,
+    *,
+    diagnostics_structured: bool = False,
+) -> dict:
+    structured = payload if diagnostics_structured else add_structured_diagnostics(payload)
+    groups: dict[str, dict] = {}
+    for diagnostic in structured.get("diagnostics", []) or []:
+        if not isinstance(diagnostic, dict):
+            continue
+        recovery_actions = diagnostic.get("recovery_actions", [])
+        key_fields = {
+            "severity": diagnostic.get("severity"),
+            "category": diagnostic.get("category"),
+            "code": diagnostic.get("code"),
+            "recovery_actions": recovery_actions,
+        }
+        key = json.dumps(key_fields, sort_keys=True, separators=(",", ":"))
+        group = groups.setdefault(key, {
+            **key_fields,
+            "count": 0,
+            "occurrences": [],
+        })
+        group["count"] += 1
+        group["occurrences"].append(diagnostic)
+
+    compact = {
+        "schema": COMPACT_RESULT_SCHEMA,
+        "result": structured.get("result", structured.get("verdict")),
+        "diagnostic_groups": list(groups.values()),
+    }
+    preserved_fields = {"result", "verdict", "diagnostics"}
+    if isinstance(structured.get("schema"), str):
+        compact["source_schema"] = structured["schema"]
+        preserved_fields.add("schema")
+    for field in (
+        "verdict",
+        "phase",
+        "operation_state",
+        "changed",
+        "atomicity",
+        "authorization_state",
+        "receipt_bindings",
+        "human_approval_required",
+        "approval_summary",
+        "recovery",
+        "recovery_actions",
+    ):
+        if field in structured:
+            compact[field] = structured[field]
+            preserved_fields.add(field)
+    compact["claim_boundary"] = {
+        "presentation_only": True,
+        "producer_payload_unchanged": True,
+        "diagnostic_occurrences_preserved": True,
+        "full_output_available_without_compact": True,
+        "omitted_top_level_fields": sorted(
+            set(structured) - preserved_fields
+        ),
+    }
+    return compact
+
+
+def emit(payload: dict) -> int:
+    structured = add_structured_diagnostics(payload)
+    rendered = (
+        compact_result_payload(structured, diagnostics_structured=True)
+        if _COMPACT_OUTPUT.get()
+        else structured
+    )
+    print(json.dumps(rendered, indent=2, sort_keys=True))
+    return result_exit_code(structured)
 
 
 def path_matches(candidate: str, pattern: str) -> bool:
@@ -845,15 +1004,13 @@ def extract_impact_receipt(payload: object) -> tuple[dict | None, list[dict]]:
     return payload, []
 
 
-def validate_adapter_command(args: argparse.Namespace) -> None:
+def validate_adapter_command(args: argparse.Namespace) -> int:
     adapter, missing = load_json_or_missing(Path(args.adapter))
     if missing:
-        emit(missing)
-        return
+        return emit(missing)
     structural = validate_adapter(adapter)
     if structural["result"] == "fail":
-        emit(structural)
-        return
+        return emit(structural)
     if not args.workspace:
         structural["result"] = "unproven"
         structural["coverage"] = {
@@ -862,29 +1019,25 @@ def validate_adapter_command(args: argparse.Namespace) -> None:
         structural["recovery"] = (
             "Rerun validate-adapter with --workspace to verify the required root README.md."
         )
-        emit(structural)
-        return
-    emit(validate_live_adapter(adapter, Path(args.workspace)))
+        return emit(structural)
+    return emit(validate_live_adapter(adapter, Path(args.workspace)))
 
 
-def work_map_command(args: argparse.Namespace) -> None:
+def work_map_command(args: argparse.Namespace) -> int:
     adapter, missing = load_json_or_missing(Path(args.adapter))
     if missing:
-        emit(missing)
-        return
+        return emit(missing)
     validation = validate_live_adapter(adapter, Path(args.workspace))
     if validation["result"] != "pass":
-        emit(validation)
-        return
+        return emit(validation)
     if "work_map" not in adapter:
-        emit({
+        return emit({
             "result": "unproven",
             "mechanical_findings": [],
             "semantic_findings": [],
             "human_approval_required": [],
             "recovery": "Add an optional work_map adapter configuration before using Work Map commands.",
         })
-        return
     workspace = Path(args.workspace)
     if args.work_map_action == "status":
         manifest, findings = load_event_manifest(args.event_manifest)
@@ -899,26 +1052,30 @@ def work_map_command(args: argparse.Namespace) -> None:
                     "actual": str(declared_workspace.resolve()),
                 })
         if findings:
-            emit({
+            return emit({
                 "result": "fail",
                 "mechanical_findings": findings,
                 "semantic_findings": [],
                 "human_approval_required": [],
                 "recovery": "Correct the event manifest before deriving Work Map status.",
             })
-            return
         binding = manifest.get("work_map_binding") if manifest is not None else None
         if not isinstance(binding, dict):
-            emit({
+            return emit({
                 "result": "unproven",
                 "mechanical_findings": [],
                 "semantic_findings": [],
                 "human_approval_required": [],
                 "recovery": "Bind the event manifest to a Work Map item before deriving status.",
             })
-            return
         try:
-            payload = work_map_status(adapter, workspace, binding, manifest)
+            payload = work_map_status(
+                adapter,
+                workspace,
+                binding,
+                manifest,
+                manifest_path=Path(args.event_manifest),
+            )
         except (OSError, UnicodeError) as exc:
             payload = {
                 "result": "unproven",
@@ -955,7 +1112,7 @@ def work_map_command(args: argparse.Namespace) -> None:
         )
     else:
         payload = render_work_map(adapter, workspace, args.format)
-    emit(payload)
+    return emit(payload)
 
 
 def assertion_finding(
@@ -1128,8 +1285,8 @@ def run_cases(args: argparse.Namespace) -> dict:
     }
 
 
-def run_cases_command(args: argparse.Namespace) -> None:
-    emit(run_cases(args))
+def run_cases_command(args: argparse.Namespace) -> int:
+    return emit(run_cases(args))
 
 
 LINK_RE = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")
@@ -1468,9 +1625,410 @@ def diagnose(adapter: dict, workspace: Path) -> dict:
     }
 
 
-def diagnose_command(args: argparse.Namespace) -> None:
+def diagnose_command(args: argparse.Namespace) -> int:
     adapter, missing = load_json_or_missing(Path(args.adapter))
-    emit(missing if missing else diagnose(adapter, Path(args.workspace)))
+    return emit(missing if missing else diagnose(adapter, Path(args.workspace)))
+
+
+def _audit_event_result(
+    result: str,
+    *,
+    manifest_path: Path,
+    checks: dict | None = None,
+    findings: list[dict] | None = None,
+    current_attempt: dict | None = None,
+    supported_claims: list[str] | None = None,
+    unsupported_claims: list[str] | None = None,
+    recovery: list[str] | None = None,
+) -> dict:
+    actions = recovery or [
+        "Correct the supplied evidence and rerun audit-event without modifying the event manifest."
+    ]
+    return {
+        "schema": AUDIT_EVENT_RESULT_SCHEMA,
+        "result": result,
+        "event_manifest": str(manifest_path),
+        "current_attempt": current_attempt,
+        "checks": checks or {},
+        "mechanical_findings": findings or [],
+        "semantic_findings": [],
+        "human_approval_required": [],
+        "supported_claims": supported_claims or [],
+        "unsupported_claims": unsupported_claims or [
+            "actor identity",
+            "semantic truth of project claims",
+            "human approval",
+            "release, deployment, product acceptance, or readiness",
+        ],
+        "recovery_actions": actions,
+        "recovery": actions[0],
+        "read_only": True,
+    }
+
+
+def audit_event(
+    *,
+    adapter_path: Path,
+    workspace: Path,
+    manifest_path: Path,
+) -> dict:
+    """Audit only the explicitly selected current Event Manifest v2 attempt."""
+    workspace = workspace.resolve()
+    checks: dict[str, dict] = {}
+    unsupported = [
+        "actor identity",
+        "semantic truth of project claims",
+        "human approval",
+        "release, deployment, product acceptance, or readiness",
+    ]
+    try:
+        manifest_stat = manifest_path.lstat()
+    except OSError:
+        return _audit_event_result(
+            "unproven",
+            manifest_path=manifest_path,
+            checks={"manifest": {"status": "missing"}},
+            findings=[{"code": "audit-event-manifest-missing", "path": str(manifest_path)}],
+            unsupported_claims=unsupported,
+            recovery=["Supply the exact Event Manifest v2 path and rerun audit-event."],
+        )
+    if manifest_path.is_symlink() or not stat.S_ISREG(manifest_stat.st_mode) or manifest_stat.st_nlink != 1:
+        return _audit_event_result(
+            "fail",
+            manifest_path=manifest_path,
+            checks={"manifest": {"status": "fail"}},
+            findings=[{"code": "audit-event-manifest-path-unsafe", "path": str(manifest_path)}],
+            unsupported_claims=unsupported,
+            recovery=["Supply one canonical regular Event Manifest v2 file with no symlink or hardlink aliases."],
+        )
+
+    adapter, adapter_missing = load_json_or_missing(adapter_path)
+    if adapter_missing is not None:
+        return _audit_event_result(
+            adapter_missing["result"],
+            manifest_path=manifest_path,
+            checks={"adapter": {"status": adapter_missing["result"]}},
+            findings=list(adapter_missing.get("mechanical_findings", [])),
+            unsupported_claims=unsupported,
+            recovery=[adapter_missing["recovery"]],
+        )
+    adapter_validation = validate_live_adapter(adapter, workspace)
+    if adapter_validation["result"] != "pass":
+        return _audit_event_result(
+            "fail",
+            manifest_path=manifest_path,
+            checks={"adapter": {"status": "fail"}},
+            findings=list(adapter_validation.get("mechanical_findings", [])),
+            unsupported_claims=unsupported,
+            recovery=["Repair the supplied adapter or workspace navigation contract, then rerun audit-event."],
+        )
+    checks["adapter"] = {"status": "pass"}
+
+    try:
+        manifest, manifest_finding = load_json_object(
+            manifest_path,
+            input_name="event-manifest",
+            category="receipt_format",
+        )
+    except FileNotFoundError:
+        manifest = None
+        manifest_finding = {"code": "audit-event-manifest-missing"}
+    if manifest_finding is not None:
+        return _audit_event_result(
+            "fail",
+            manifest_path=manifest_path,
+            checks={**checks, "manifest": {"status": "fail"}},
+            findings=[manifest_finding],
+            unsupported_claims=unsupported,
+            recovery=["Supply readable object JSON for the exact Event Manifest v2 path."],
+        )
+    if manifest.get("schema") == EVENT_MANIFEST_SCHEMA:
+        return _audit_event_result(
+            "unproven",
+            manifest_path=manifest_path,
+            checks={**checks, "manifest": {"status": "unsupported-v1"}},
+            findings=[{"code": "audit-event-v1-unsupported"}],
+            unsupported_claims=unsupported + [
+                "Event Manifest v1 has no explicit append-only current-attempt ledger",
+            ],
+            recovery=["Create and close a new Event Manifest v2 event; do not infer or upgrade the v1 current attempt."],
+        )
+    normalized, manifest_findings = validate_event_manifest(
+        manifest,
+        manifest_path=manifest_path,
+        workspace=workspace,
+        adapter=adapter,
+    )
+    if normalized is None or manifest_findings:
+        return _audit_event_result(
+            "fail",
+            manifest_path=manifest_path,
+            checks={**checks, "manifest": {"status": "fail"}},
+            findings=manifest_findings,
+            unsupported_claims=unsupported,
+            recovery=["Repair the exact Event Manifest v2 structure and bound attempt evidence, then rerun audit-event."],
+        )
+    event = normalized.get("event", {})
+    try:
+        recorded_workspace = Path(event.get("workspace", ""))
+        if not recorded_workspace.is_absolute():
+            recorded_workspace = manifest_path.parent / recorded_workspace
+        workspace_matches = recorded_workspace.resolve() == workspace
+    except (OSError, RuntimeError):
+        workspace_matches = False
+    if not workspace_matches:
+        return _audit_event_result(
+            "fail",
+            manifest_path=manifest_path,
+            checks={**checks, "manifest": {"status": "fail"}},
+            findings=[{"code": "audit-event-workspace-mismatch"}],
+            unsupported_claims=unsupported,
+            recovery=["Use the workspace recorded by the Event Manifest v2 or supply the matching manifest."],
+        )
+    checks["manifest"] = {
+        "status": "pass",
+        "schema": normalized["schema"],
+        "schema_version": normalized["schema_version"],
+    }
+
+    current = current_closeout_attempt(
+        normalized,
+        manifest_path=manifest_path,
+        workspace=workspace,
+        adapter=adapter,
+    )
+    if current.get("status") == "missing":
+        return _audit_event_result(
+            "unproven",
+            manifest_path=manifest_path,
+            checks={**checks, "current": {"status": "missing"}},
+            findings=[{"code": "audit-event-current-missing"}],
+            unsupported_claims=unsupported,
+            recovery=["Complete a passing v2 Closeout attempt and set closeout.current through the Closeout command."],
+        )
+    if current.get("status") != "matching":
+        return _audit_event_result(
+            "fail",
+            manifest_path=manifest_path,
+            checks={**checks, "current": {"status": "fail"}},
+            findings=list(current.get("findings", [])),
+            unsupported_claims=unsupported,
+            recovery=["Repair the explicit current attempt and its immutable evidence bindings; do not scan for a replacement."],
+        )
+    attempt = current["attempt"]
+    receipt = current["receipt"]
+    checks["current"] = {"status": "pass", "id": attempt["id"]}
+    checks["receipt"] = {
+        "status": "pass",
+        "path": current["receipt_path"],
+        "schema": current["receipt_binding"]["schema"],
+        "digest": current["receipt_binding"]["digest"],
+    }
+
+    impact_binding = receipt.get("impact")
+    impact = impact_binding.get("receipt") if isinstance(impact_binding, dict) else None
+    impact_findings = validate_impact_receipt(impact, adapter, workspace)
+    if isinstance(impact, dict):
+        if not (
+            impact.get("derived_evidence") is True
+            and impact.get("generated") is True
+            and impact.get("project_authority") is False
+        ):
+            impact_findings.append({
+                "code": "audit-event-impact-provenance-invalid",
+            })
+        capability = impact.get("verification_capability")
+        if not (
+            isinstance(capability, dict)
+            and capability.get("baseline_inventory") is True
+            and capability.get("event_isolation") is True
+        ):
+            impact_findings.append({
+                "code": "audit-event-impact-verification-capability-invalid",
+            })
+        inventory_source = impact.get("inventory_source")
+        if not (
+            isinstance(inventory_source, dict)
+            and inventory_source.get("verified") is True
+            and isinstance(inventory_source.get("kind"), str)
+            and inventory_source["kind"] in {"git", "filesystem"}
+            and isinstance(inventory_source.get("metadata"), dict)
+        ):
+            impact_findings.append({
+                "code": "audit-event-impact-inventory-source-invalid",
+            })
+        planned_paths = impact.get("planned_paths")
+        if isinstance(planned_paths, list):
+            normalized_paths = []
+            for path in planned_paths:
+                normalized_path, path_finding = normalize_path_value(
+                    path, "planned_paths",
+                )
+                if path_finding:
+                    impact_findings.append({
+                        "code": "audit-event-impact-path-invalid",
+                        "path": path,
+                    })
+                else:
+                    normalized_paths.append(normalized_path)
+            if len(normalized_paths) != len(set(normalized_paths)):
+                impact_findings.append({
+                    "code": "audit-event-impact-path-duplicate",
+                })
+            recalculated_scope = analyze_impact_scope(adapter, normalized_paths)
+            for field in (
+                "affected_authorities",
+                "candidate_authority_paths",
+                "protected_paths",
+                "excluded_paths",
+                "human_approval_required",
+            ):
+                if sorted(impact.get(field, [])) != sorted(
+                    recalculated_scope.get(field, [])
+                ):
+                    impact_findings.append({
+                        "code": "audit-event-impact-scope-projection-mismatch",
+                        "field": field,
+                    })
+    expected_adapter_binding = {
+        "path": str(adapter_path.resolve()),
+        "digest": canonical_evidence_v1_digest(adapter),
+    }
+    if isinstance(impact, dict) and impact.get("adapter_binding") != expected_adapter_binding:
+        impact_findings.append({"code": "audit-event-impact-adapter-binding-mismatch"})
+    impact_metadata = (
+        (impact.get("inventory_source") or {}).get("metadata", {})
+        if isinstance(impact, dict)
+        else {}
+    )
+    baseline = event.get("baseline_ref")
+    observed_baseline = impact_metadata.get("baseline_ref", impact_metadata.get("head"))
+    if baseline is not None and observed_baseline != baseline:
+        impact_findings.append({"code": "audit-event-impact-baseline-mismatch"})
+    if impact_findings:
+        return _audit_event_result(
+            "fail",
+            manifest_path=manifest_path,
+            checks={**checks, "impact": {"status": "fail"}},
+            findings=impact_findings,
+            current_attempt={"id": attempt["id"]},
+            unsupported_claims=unsupported,
+            recovery=["Restore the exact adapter-, workspace-, and baseline-bound Impact snapshot referenced by the current receipt."],
+        )
+    checks["impact"] = {
+        "status": "pass",
+        "digest": impact_binding["digest"],
+    }
+
+    freeze_binding = receipt.get("freeze")
+    freeze = freeze_binding.get("receipt") if isinstance(freeze_binding, dict) else None
+    final_paths = (receipt.get("final_content") or {}).get("paths", [])
+    freeze_summary, freeze_findings, freeze_unverified = evaluate_freeze_receipt(
+        None,
+        adapter=adapter,
+        workspace=workspace,
+        event_paths=final_paths,
+        receipt_payload=freeze,
+    )
+    if freeze_findings:
+        return _audit_event_result(
+            "fail",
+            manifest_path=manifest_path,
+            checks={
+                **checks,
+                "freeze": {"status": "fail"},
+                "current_content": {
+                    "status": "fail",
+                    "stale_paths": freeze_summary.get("stale_paths", []),
+                },
+            },
+            findings=freeze_findings,
+            current_attempt={"id": attempt["id"]},
+            unsupported_claims=unsupported,
+            recovery=["Restore or refreeze the exact current event content, rerun affected validation and Closeout, then rerun audit-event."],
+        )
+    if freeze_unverified:
+        return _audit_event_result(
+            "unproven",
+            manifest_path=manifest_path,
+            checks={**checks, "freeze": {"status": "unproven"}},
+            findings=[{"code": "audit-event-freeze-unproven", "fields": freeze_unverified}],
+            current_attempt={"id": attempt["id"]},
+            unsupported_claims=unsupported,
+            recovery=["Supply the complete Freeze snapshot bound by the current Closeout receipt."],
+        )
+    checks["freeze"] = {
+        "status": "pass",
+        "digest": freeze_binding["digest"],
+        "paths": freeze_summary["paths"],
+    }
+    checks["current_content"] = {"status": "pass", "paths": freeze_summary["paths"]}
+
+    attestation_binding = current.get("attestation_binding")
+    supported = [
+        "explicit Event Manifest v2 current attempt",
+        "current Closeout receipt schema and canonical digest binding",
+        "current receipt Impact and Freeze snapshots bind the supplied adapter and workspace",
+        "current frozen event content matches the supplied workspace",
+    ]
+    if attestation_binding is None:
+        checks["attestation"] = {"status": "not-bound"}
+        unsupported.append(
+            "portable attestation claims because the current attempt has no attestation binding"
+        )
+    else:
+        attestation_path = Path(current["attestation_path"])
+        parsed = parse_closeout_attestation(
+            attestation_path,
+            current_schemas=[CLOSEOUT_ATTESTATION_SCHEMA],
+            historical_schemas=[],
+        )
+        bound = bind_closeout_attestation(
+            parsed,
+            path=attestation_path,
+            adapter=adapter,
+            workspace=workspace,
+            manifest=normalized,
+            manifest_path=manifest_path,
+        )
+        if bound.get("status") != "matching":
+            return _audit_event_result(
+                "fail",
+                manifest_path=manifest_path,
+                checks={**checks, "attestation": {"status": "fail", "binding_status": bound.get("status")}},
+                findings=[{"code": "audit-event-attestation-binding-invalid", "status": bound.get("status")}],
+                current_attempt={"id": attempt["id"]},
+                supported_claims=supported,
+                unsupported_claims=unsupported,
+                recovery=["Restore the exact current attempt attestation and its complete source-context binding."],
+            )
+        checks["attestation"] = {
+            "status": "pass",
+            "path": current["attestation_path"],
+            "schema": attestation_binding["schema"],
+            "digest": attestation_binding["digest"],
+        }
+        supported.append(
+            "current immutable Closeout attestation path, schema, canonical digest, and source context"
+        )
+
+    return _audit_event_result(
+        "pass",
+        manifest_path=manifest_path,
+        checks=checks,
+        current_attempt={"id": attempt["id"], "result": attempt["result"]},
+        supported_claims=supported,
+        unsupported_claims=unsupported,
+        recovery=["Preserve the audited evidence; rerun audit-event whenever the workspace, adapter, manifest, receipt, or attestation bytes change."],
+    )
+
+
+def audit_event_command(args: argparse.Namespace) -> int:
+    return emit(audit_event(
+        adapter_path=Path(args.adapter),
+        workspace=Path(args.workspace),
+        manifest_path=Path(args.event_manifest),
+    ))
 
 
 EVENT_SCOPE_KEYS = {
@@ -1482,14 +2040,24 @@ EVENT_SCOPE_KEYS = {
 }
 
 
-def validate_event_manifest(manifest: object) -> tuple[dict | None, list[dict]]:
+def validate_event_manifest(
+    manifest: object,
+    *,
+    manifest_path: Path | None = None,
+    workspace: Path | None = None,
+    adapter: dict | None = None,
+) -> tuple[dict | None, list[dict]]:
     findings: list[dict] = []
     if not isinstance(manifest, dict):
         return None, [{"code": "event-manifest-invalid-field", "field": "root"}]
-    if manifest.get("schema") != EVENT_MANIFEST_SCHEMA:
+    schema = manifest.get("schema")
+    schema_version = manifest.get("schema_version")
+    if schema not in {EVENT_MANIFEST_SCHEMA, EVENT_MANIFEST_V2_SCHEMA}:
         findings.append({"code": "event-manifest-invalid-field", "field": "schema"})
-    if manifest.get("schema_version") != "1":
+    expected_version = "2" if schema == EVENT_MANIFEST_V2_SCHEMA else "1"
+    if schema_version != expected_version:
         findings.append({"code": "event-manifest-invalid-field", "field": "schema_version"})
+    is_v2 = schema == EVENT_MANIFEST_V2_SCHEMA and schema_version == "2"
 
     event = manifest.get("event")
     if not isinstance(event, dict):
@@ -1547,11 +2115,19 @@ def validate_event_manifest(manifest: object) -> tuple[dict | None, list[dict]]:
     if not isinstance(receipts, dict):
         findings.append({"code": "event-manifest-invalid-field", "field": "receipts"})
         receipts = {}
-    for key in ("impact", "freeze", "closeout_attestation"):
+    receipt_keys = ("impact", "freeze") if is_v2 else (
+        "impact", "freeze", "closeout_attestation",
+    )
+    for key in receipt_keys:
         if key not in receipts or (
             receipts.get(key) is not None and not isinstance(receipts.get(key), dict)
         ):
             findings.append({"code": "event-manifest-invalid-field", "field": f"receipts.{key}"})
+    if is_v2 and "closeout_attestation" in receipts:
+        findings.append({
+            "code": "event-manifest-invalid-field",
+            "field": "receipts.closeout_attestation",
+        })
     if not isinstance(receipts.get("validation"), list) or not all(
         isinstance(item, str) for item in receipts.get("validation", [])
     ):
@@ -1560,22 +2136,48 @@ def validate_event_manifest(manifest: object) -> tuple[dict | None, list[dict]]:
     if not isinstance(closeout, dict):
         findings.append({"code": "event-manifest-invalid-field", "field": "closeout"})
         closeout = {}
-    if "result" not in closeout or closeout.get("result") not in {None, "pass", "fail", "unproven"}:
-        findings.append({"code": "event-manifest-invalid-field", "field": "closeout.result"})
-    if not isinstance(closeout.get("result_reasons"), list) or not all(
-        isinstance(item, str) for item in closeout.get("result_reasons", [])
-    ):
-        findings.append({
-            "code": "event-manifest-invalid-field",
-            "field": "closeout.result_reasons",
-        })
-    if not isinstance(closeout.get("recovery_actions"), list) or not all(
-        isinstance(item, str) for item in closeout.get("recovery_actions", [])
-    ):
-        findings.append({
-            "code": "event-manifest-invalid-field",
-            "field": "closeout.recovery_actions",
-        })
+    if is_v2:
+        if not isinstance(closeout.get("attempts"), list):
+            findings.append({
+                "code": "event-manifest-invalid-field",
+                "field": "closeout.attempts",
+            })
+        if closeout.get("current") is not None and not isinstance(
+            closeout.get("current"), str,
+        ):
+            findings.append({
+                "code": "event-manifest-invalid-field",
+                "field": "closeout.current",
+            })
+        for field in ("result", "result_reasons", "recovery_actions"):
+            if field in closeout:
+                findings.append({
+                    "code": "event-manifest-invalid-field",
+                    "field": f"closeout.{field}",
+                })
+        findings.extend(validate_event_manifest_closeout_ledger(
+            manifest,
+            manifest_path=manifest_path,
+            workspace=workspace,
+            adapter=adapter,
+        ))
+    else:
+        if "result" not in closeout or closeout.get("result") not in {None, "pass", "fail", "unproven"}:
+            findings.append({"code": "event-manifest-invalid-field", "field": "closeout.result"})
+        if not isinstance(closeout.get("result_reasons"), list) or not all(
+            isinstance(item, str) for item in closeout.get("result_reasons", [])
+        ):
+            findings.append({
+                "code": "event-manifest-invalid-field",
+                "field": "closeout.result_reasons",
+            })
+        if not isinstance(closeout.get("recovery_actions"), list) or not all(
+            isinstance(item, str) for item in closeout.get("recovery_actions", [])
+        ):
+            findings.append({
+                "code": "event-manifest-invalid-field",
+                "field": "closeout.recovery_actions",
+            })
 
     binding = manifest.get("work_map_binding")
     if binding is not None:
@@ -1609,26 +2211,52 @@ def validate_event_manifest(manifest: object) -> tuple[dict | None, list[dict]]:
         key=lambda item: json.dumps(item, sort_keys=True),
     )
     normalized["receipts"]["validation"] = sorted(set(normalized["receipts"]["validation"]))
-    normalized["closeout"]["result_reasons"] = sorted(
-        set(normalized["closeout"]["result_reasons"])
-    )
-    normalized["closeout"]["recovery_actions"] = sorted(
-        set(normalized["closeout"]["recovery_actions"])
-    )
+    if not is_v2:
+        normalized["closeout"]["result_reasons"] = sorted(
+            set(normalized["closeout"]["result_reasons"])
+        )
+        normalized["closeout"]["recovery_actions"] = sorted(
+            set(normalized["closeout"]["recovery_actions"])
+        )
     return normalized, []
 
 
-def load_event_manifest(path: str | None) -> tuple[dict | None, list[dict]]:
+def load_event_manifest(
+    path: str | None,
+    *,
+    workspace: Path | None = None,
+    adapter: dict | None = None,
+) -> tuple[dict | None, list[dict]]:
+    manifest, findings, _digest = load_event_manifest_snapshot(
+        path,
+        workspace=workspace,
+        adapter=adapter,
+    )
+    return manifest, findings
+
+
+def load_event_manifest_snapshot(
+    path: str | None,
+    *,
+    workspace: Path | None = None,
+    adapter: dict | None = None,
+) -> tuple[dict | None, list[dict], str | None]:
     if not path:
-        return None, []
+        return None, [], None
     manifest_path = Path(path)
     try:
         raw = json.loads(manifest_path.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        return None, [{"code": "event-manifest-missing", "path": path}]
+        return None, [{"code": "event-manifest-missing", "path": path}], None
     except (json.JSONDecodeError, UnicodeDecodeError):
-        return None, [{"code": "event-manifest-invalid-json", "path": path}]
-    return validate_event_manifest(raw)
+        return None, [{"code": "event-manifest-invalid-json", "path": path}], None
+    manifest, findings = validate_event_manifest(
+        raw,
+        manifest_path=manifest_path,
+        workspace=workspace,
+        adapter=adapter,
+    )
+    return manifest, findings, canonical_evidence_v1_digest(raw)
 
 
 def load_paths_from(path: str) -> tuple[list[str], list[dict]]:
@@ -1679,7 +2307,10 @@ def prepare_event_manifest(
     *,
     phase: str,
 ) -> tuple[dict | None, list[dict]]:
-    manifest, findings = load_event_manifest(getattr(args, "event_manifest", None))
+    manifest, findings, raw_digest = load_event_manifest_snapshot(
+        getattr(args, "event_manifest", None),
+    )
+    args.event_manifest_expected_digest = raw_digest
     workspace = Path(args.workspace).resolve() if getattr(args, "workspace", None) else None
     if getattr(args, "event_manifest", None) and workspace is None:
         findings.append({"code": "event-manifest-workspace-required"})
@@ -1753,6 +2384,8 @@ def write_event_manifest(
     path: str,
     workspace: Path,
     adapter: dict,
+    *,
+    expected_digest: str | None = None,
 ) -> list[dict]:
     destination, findings = resolve_receipt_output_path(path, workspace, adapter)
     if findings or destination is None:
@@ -1764,10 +2397,273 @@ def write_event_manifest(
             for finding in findings
         ]
     try:
-        atomic_write_json(manifest, destination)
-    except OSError as exc:
+        candidate_declares_v2 = (
+            isinstance(manifest, dict)
+            and manifest.get("schema") == EVENT_MANIFEST_V2_SCHEMA
+        )
+        destination_declares_v2 = False
+        if not candidate_declares_v2 and destination.exists():
+            persisted, persisted_finding = load_json_object(
+                destination,
+                input_name="event-manifest",
+                category="receipt_format",
+            )
+            if (
+                isinstance(persisted_finding, dict)
+                and persisted_finding.get("code") == "event-manifest-unreadable"
+            ):
+                return [{
+                    **persisted_finding,
+                    "code": "event-manifest-destination-unreadable",
+                    "message": (
+                        "The existing event manifest cannot be read, so its schema "
+                        "cannot be proven safe for a legacy replacement."
+                    ),
+                }]
+            destination_declares_v2 = (
+                isinstance(persisted, dict)
+                and persisted.get("schema") == EVENT_MANIFEST_V2_SCHEMA
+            )
+        requires_v2_guard = candidate_declares_v2 or destination_declares_v2
+        if requires_v2_guard and fcntl is None:
+            return [{
+                "code": "event-manifest-lock-unavailable",
+                "path": path,
+                "message": (
+                    "Event Manifest v2 publication requires an inter-process "
+                    "file lock, but this runtime does not provide fcntl."
+                ),
+                "diagnostic": {
+                    "severity": "blocking",
+                    "category": "blocking",
+                    "recovery_actions": [
+                        "Retry the v2 write on a runtime with the required lock "
+                        "capability, without an unlocked fallback."
+                    ],
+                },
+            }]
+        if requires_v2_guard and expected_digest is None:
+            return [{
+                "code": "event-manifest-cas-required",
+                "path": path,
+                "message": (
+                    "Event Manifest v2 publication requires the canonical digest "
+                    "of the exact manifest snapshot being replaced."
+                ),
+                "diagnostic": {
+                    "severity": "blocking",
+                    "category": "blocking",
+                    "recovery_actions": [
+                        "Reload the v2 manifest and retry with its raw canonical "
+                        "digest; do not publish without compare-and-swap."
+                    ],
+                },
+            }]
+        if expected_digest is None:
+            atomic_write_json(manifest, destination)
+            return []
+        if fcntl is None:
+            atomic_write_json(manifest, destination)
+            return []
+        lock_fd = os.open(destination.parent, os.O_RDONLY)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            try:
+                persisted = load_json(destination)
+                actual_digest = canonical_evidence_v1_digest(persisted)
+                if actual_digest != expected_digest:
+                    return [{
+                        "code": "event-manifest-concurrent-update",
+                        "path": path,
+                        "expected_digest": expected_digest,
+                        "actual_digest": actual_digest,
+                    }]
+                atomic_write_json(manifest, destination)
+            finally:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
+    except (OSError, FileNotFoundError, SystemExit) as exc:
         return [{"code": "event-manifest-write-failed", "path": path, "message": str(exc)}]
     return []
+
+
+def event_manifest_is_v2(manifest: dict | None) -> bool:
+    return bool(
+        isinstance(manifest, dict)
+        and manifest.get("schema") == EVENT_MANIFEST_V2_SCHEMA
+        and manifest.get("schema_version") == "2"
+    )
+
+
+def event_manifest_evidence_binding(
+    path: str,
+    payload: dict,
+    *,
+    schema: str,
+    manifest_path: str,
+) -> dict:
+    destination = Path(path).resolve()
+    manifest_parent = Path(manifest_path).resolve().parent
+    try:
+        stored_path = destination.relative_to(manifest_parent).as_posix()
+    except ValueError:
+        stored_path = str(destination)
+    return {
+        "path": stored_path,
+        "schema": schema,
+        "digest": canonical_evidence_v1_digest(payload),
+    }
+
+
+def write_or_reuse_json_evidence(
+    payload: dict,
+    output_path: str,
+    workspace: Path,
+    adapter: dict,
+    *,
+    kind: str,
+) -> tuple[str | None, list[dict]]:
+    destination, findings = resolve_receipt_output_path(
+        output_path, workspace, adapter,
+    )
+    if findings or destination is None:
+        return None, [
+            {
+                **finding,
+                "code": f"unsafe-{kind}-output-path",
+            }
+            for finding in findings
+        ]
+    if destination.exists() or destination.is_symlink():
+        if destination.is_symlink() or not destination.is_file():
+            return None, [{
+                "code": f"{kind}-already-exists",
+                "path": str(destination),
+            }]
+        try:
+            existing = load_json(destination)
+        except (FileNotFoundError, SystemExit):
+            existing = None
+        if (
+            isinstance(existing, dict)
+            and existing == payload
+            and canonical_evidence_v1_digest(existing)
+            == canonical_evidence_v1_digest(payload)
+        ):
+            if not recover_interrupted_create_only_aliases(destination):
+                return None, [{
+                    "code": f"{kind}-already-exists",
+                    "path": str(destination),
+                }]
+            return str(destination), []
+        return None, [{
+            "code": f"{kind}-already-exists",
+            "path": str(destination),
+        }]
+    try:
+        atomic_write_json(payload, destination, overwrite=False)
+        persisted = load_json(destination)
+    except (OSError, FileNotFoundError, SystemExit) as exc:
+        return None, [{
+            "code": f"{kind}-write-failed",
+            "path": str(destination),
+            "message": str(exc),
+        }]
+    if (
+        persisted != payload
+        or canonical_evidence_v1_digest(persisted)
+        != canonical_evidence_v1_digest(payload)
+    ):
+        return None, [{
+            "code": f"{kind}-reread-mismatch",
+            "path": str(destination),
+        }]
+    return str(destination), []
+
+
+def recover_interrupted_create_only_aliases(destination: Path) -> bool:
+    """Remove only recognized post-link/pre-unlink temp aliases."""
+    try:
+        destination_stat = destination.stat()
+    except OSError:
+        return False
+    if destination_stat.st_nlink == 1:
+        return True
+    pattern = re.compile(
+        rf"^\.{re.escape(destination.name)}\.[0-9a-f]{{64}}\.tmp$",
+    )
+    aliases: list[Path] = []
+    try:
+        for candidate in destination.parent.iterdir():
+            if not pattern.fullmatch(candidate.name):
+                continue
+            candidate_stat = candidate.lstat()
+            if (
+                stat.S_ISREG(candidate_stat.st_mode)
+                and (candidate_stat.st_dev, candidate_stat.st_ino)
+                == (destination_stat.st_dev, destination_stat.st_ino)
+            ):
+                aliases.append(candidate)
+    except OSError:
+        return False
+    if not aliases or destination_stat.st_nlink != len(aliases) + 1:
+        return False
+    try:
+        for alias in aliases:
+            alias.unlink()
+        return destination.stat().st_nlink == 1
+    except OSError:
+        return False
+
+
+def append_v2_closeout_attempt(
+    *,
+    manifest: dict,
+    manifest_path: str,
+    attempt_id: str,
+    payload: dict,
+    receipt_path: str,
+    attestation: dict | None,
+    attestation_path: str | None,
+    freeze_receipt: dict,
+    workspace: Path,
+    adapter: dict,
+) -> tuple[dict | None, list[dict]]:
+    candidate = json.loads(json.dumps(manifest))
+    attempt = {
+        "id": attempt_id,
+        "result": payload["result"],
+        "result_reasons": list(payload.get("result_reasons", [])),
+        "recovery_actions": list(payload.get("recovery_actions", [])),
+        "receipt": event_manifest_evidence_binding(
+            receipt_path,
+            payload["closeout_receipt"],
+            schema="govern-ai-coding.closeout-receipt.v1",
+            manifest_path=manifest_path,
+        ),
+        "freeze_digest": canonical_evidence_v1_digest(freeze_receipt),
+        "attestation": (
+            event_manifest_evidence_binding(
+                attestation_path,
+                attestation,
+                schema=CLOSEOUT_ATTESTATION_SCHEMA,
+                manifest_path=manifest_path,
+            )
+            if attestation is not None and attestation_path is not None
+            else None
+        ),
+    }
+    candidate["closeout"]["attempts"].append(attempt)
+    if payload["result"] == "pass":
+        candidate["closeout"]["current"] = attempt_id
+    normalized, findings = validate_event_manifest(
+        candidate,
+        manifest_path=Path(manifest_path),
+        workspace=workspace,
+        adapter=adapter,
+    )
+    return normalized, findings
 
 
 def evaluate_impact_path_reconciliation(
@@ -1907,7 +2803,7 @@ def impact_extension_payload(
     recovery_actions: list[str] = []
     expected_binding = {
         "path": str(adapter_path.resolve()),
-        "digest": canonical_json_digest(adapter),
+        "digest": canonical_evidence_v1_digest(adapter),
     }
     if parent_receipt.get("adapter_binding") != expected_binding:
         unverified.append("impact-extension-parent-adapter-unbound")
@@ -1974,7 +2870,7 @@ def impact_extension_payload(
     })
     extensions = list(extended.get("scope_extensions", []))
     extensions.append({
-        "parent_receipt_digest": canonical_json_digest(parent_receipt),
+        "parent_receipt_digest": canonical_evidence_v1_digest(parent_receipt),
         "added_paths": added_paths,
         "baseline_observations": sorted(
             observations,
@@ -1990,8 +2886,13 @@ def impact_extension_payload(
     return extended, [], [], []
 
 
-def impact_command(args: argparse.Namespace) -> None:
+def impact_command(args: argparse.Namespace) -> int:
     manifest, manifest_findings = prepare_event_manifest(args, phase="impact")
+    manifest_expected_digest = (
+        args.event_manifest_expected_digest
+        if event_manifest_is_v2(manifest)
+        else None
+    )
     adapter, missing = load_json_or_missing(Path(args.adapter))
     changed_paths, path_findings = normalize_paths_with_findings(args.changed_path, "changed_path")
     if missing:
@@ -2003,8 +2904,7 @@ def impact_command(args: argparse.Namespace) -> None:
             "evidence_entrypoints": [],
             "approval_requirements": [],
         }
-        emit(missing)
-        return
+        return emit(missing)
 
     adapter_result = (
         validate_live_adapter(adapter, Path(args.workspace))
@@ -2012,7 +2912,7 @@ def impact_command(args: argparse.Namespace) -> None:
         else validate_adapter(adapter)
     )
     if adapter_result["result"] == "fail":
-        emit({
+        return emit({
             "result": "fail",
             "impact": {
                 "changed_paths": changed_paths,
@@ -2027,7 +2927,14 @@ def impact_command(args: argparse.Namespace) -> None:
             "human_approval_required": [],
             "recovery": "Impact cannot run until the project adapter validates.",
         })
-        return
+    if manifest is not None and args.workspace:
+        manifest, contextual_findings = validate_event_manifest(
+            manifest,
+            manifest_path=Path(args.event_manifest),
+            workspace=Path(args.workspace),
+            adapter=adapter,
+        )
+        manifest_findings.extend(contextual_findings)
 
     scope = analyze_impact_scope(adapter, changed_paths)
     affected = scope["affected_authorities"]
@@ -2039,7 +2946,7 @@ def impact_command(args: argparse.Namespace) -> None:
 
     if args.extend_receipt:
         if not args.workspace:
-            emit({
+            return emit({
                 "result": "fail",
                 "coverage": {"unverified": []},
                 "impact": {"changed_paths": changed_paths},
@@ -2052,12 +2959,11 @@ def impact_command(args: argparse.Namespace) -> None:
                 "recovery": "Supply the workspace bound to the original Impact receipt.",
                 "recovery_actions": [],
             })
-            return
         workspace = Path(args.workspace)
         try:
             parent_payload = load_json(Path(args.extend_receipt))
         except OSError as exc:
-            emit({
+            return emit({
                 "result": "fail",
                 "coverage": {"unverified": []},
                 "impact": {"changed_paths": changed_paths},
@@ -2074,7 +2980,6 @@ def impact_command(args: argparse.Namespace) -> None:
                     "Do not replace the original receipt with a new post-edit baseline."
                 ],
             })
-            return
         parent_receipt, extract_findings = extract_impact_receipt(parent_payload)
         if parent_receipt is None:
             parent_receipt = {}
@@ -2110,8 +3015,8 @@ def impact_command(args: argparse.Namespace) -> None:
             embedded_parent = manifest.get("receipts", {}).get("impact")
             if (
                 not isinstance(embedded_parent, dict)
-                or canonical_json_digest(embedded_parent)
-                != canonical_json_digest(parent_receipt)
+                or canonical_evidence_v1_digest(embedded_parent)
+                != canonical_evidence_v1_digest(parent_receipt)
             ):
                 extension_findings.append({
                     "code": "event-manifest-impact-parent-mismatch",
@@ -2141,11 +3046,12 @@ def impact_command(args: argparse.Namespace) -> None:
                 args.event_manifest,
                 workspace,
                 adapter,
+                expected_digest=manifest_expected_digest,
             )
             if write_findings:
                 extension_findings.extend(write_findings)
                 result = "fail"
-        emit({
+        return emit({
             "result": result,
             "coverage": {"unverified": extension_unverified},
             "impact": {
@@ -2166,7 +3072,6 @@ def impact_command(args: argparse.Namespace) -> None:
             "recovery_actions": recovery_actions,
             "receipt_output": output_path,
         })
-        return
     receipt = None
     receipt_findings = []
     impact_unverified = ["empty-impact-scope"] if not changed_paths else []
@@ -2248,7 +3153,7 @@ def impact_command(args: argparse.Namespace) -> None:
             "adapter": {"project": adapter.get("project"), "schema_version": adapter.get("schema_version")},
             "adapter_binding": {
                 "path": str(Path(args.adapter).resolve()),
-                "digest": canonical_json_digest(adapter),
+                "digest": canonical_evidence_v1_digest(adapter),
             },
             "workspace": {"path": str(workspace.resolve())},
             "inventory_source": {
@@ -2327,13 +3232,14 @@ def impact_command(args: argparse.Namespace) -> None:
             args.event_manifest,
             Path(args.workspace),
             adapter,
+            expected_digest=manifest_expected_digest,
         )
         if write_findings:
             payload["mechanical_findings"].extend(write_findings)
             payload["result"] = "fail"
             payload["recovery"] = "Fix event manifest output findings and rerun Impact."
     payload["receipt_output"] = output_path
-    emit(payload)
+    return emit(payload)
 
 
 def file_digest(path: Path) -> str:
@@ -2439,12 +3345,21 @@ def atomic_write_json(
         destination.parent.mkdir(parents=True, exist_ok=True)
         if not overwrite and destination.exists():
             raise FileExistsError(f"destination already exists: {destination}")
-        descriptor, temporary_name = tempfile.mkstemp(
-            prefix=f".{destination.name}.",
-            suffix=".tmp",
-            dir=destination.parent,
-        )
-        temporary = Path(temporary_name)
+        while True:
+            temporary = destination.parent / (
+                f".{destination.name}.{secrets.token_hex(32)}.tmp"
+            )
+            temporary_name = str(temporary)
+            try:
+                descriptor = os.open(
+                    temporary,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    0o600,
+                )
+                break
+            except FileExistsError:
+                continue
     else:
         if not overwrite:
             try:
@@ -2924,12 +3839,11 @@ def archive_failure(
     }
 
 
-def canonical_json_digest(payload: dict) -> str:
+def legacy_archive_receipt_v1_request_digest(payload: object) -> str:
     encoded = json.dumps(
         payload,
         sort_keys=True,
         separators=(",", ":"),
-        ensure_ascii=False,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
@@ -3184,7 +4098,7 @@ def execute_controlled_archive(
             "matched_roots": matched_archive_roots,
         })
     archive_root_sha256 = (
-        archive_protocol_digest({
+        canonical_archive_v1_digest({
             "archive_root": matched_archive_roots[0],
         })
         if len(matched_archive_roots) == 1
@@ -3549,7 +4463,7 @@ def execute_controlled_archive(
         "source_sha256": source_sha256,
         "source_size": source_size,
         "archive_root_sha256": archive_root_sha256,
-        "authority_disposition_sha256": archive_protocol_digest(
+        "authority_disposition_sha256": canonical_archive_v1_digest(
             normalized_disposition
         ),
     }
@@ -3570,7 +4484,7 @@ def execute_controlled_archive(
         approval_digest=approval_digest,
     )
     preflight["operation"] = operation
-    preflight["preflight_sha256"] = archive_protocol_digest({
+    preflight["preflight_sha256"] = canonical_archive_v1_digest({
         "base_preflight_sha256": preflight["preflight_sha256"],
         "operation": operation,
     })
@@ -3681,7 +4595,7 @@ def execute_controlled_archive(
                 adapter,
                 amendment,
                 original_operation=original_operation,
-                original_grant_digest=archive_protocol_digest(
+                original_grant_digest=canonical_archive_v1_digest(
                     original_execution_grant
                 ),
             )
@@ -3769,9 +4683,9 @@ def execute_controlled_archive(
             )
             failure["preflight"] = preflight
             return failure
-        amendment_digest = archive_protocol_digest(amendment_normalized)
+        amendment_digest = canonical_archive_v1_digest(amendment_normalized)
         preflight["amendment_sha256"] = amendment_digest
-        preflight["preflight_sha256"] = archive_protocol_digest({
+        preflight["preflight_sha256"] = canonical_archive_v1_digest({
             "base_preflight_sha256": preflight["preflight_sha256"],
             "amendment_sha256": amendment_digest,
         })
@@ -3820,7 +4734,7 @@ def execute_controlled_archive(
             "schema_version": adapter.get("schema_version"),
         },
         "workspace": {"path": str(workspace)},
-        "request_sha256": canonical_json_digest(request),
+        "request_sha256": legacy_archive_receipt_v1_request_digest(request),
         "mapping": normalized_mapping,
         "archive_reason": reason.strip(),
         "authority_disposition": normalized_disposition,
@@ -3841,7 +4755,7 @@ def execute_controlled_archive(
             "operation": "single-file active-to-immutable-archive move",
             "authorization": {
                 "grant_schema": EXECUTION_GRANT_SCHEMA,
-                "grant_sha256": archive_protocol_digest(normalized_grant),
+                "grant_sha256": canonical_archive_v1_digest(normalized_grant),
                 "preflight_sha256": preflight["preflight_sha256"],
                 "amendment_sha256": amendment_digest,
             },
@@ -4131,21 +5045,19 @@ def preflight_controlled_archive(
     )
 
 
-def controlled_archive_command(args: argparse.Namespace) -> None:
+def controlled_archive_command(args: argparse.Namespace) -> int:
     try:
         adapter, missing = load_json_or_missing(Path(args.adapter))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        emit(structured_archive_exception(
+        return emit(structured_archive_exception(
             exc,
             phase="adapter-input",
             mapping=None,
         ))
-        return
     if missing:
-        emit(missing)
-        return
+        return emit(missing)
     if not isinstance(adapter, dict):
-        emit(archive_failure(
+        return emit(archive_failure(
             result="fail",
             mechanical=[{
                 "code": "invalid-adapter",
@@ -4155,10 +5067,9 @@ def controlled_archive_command(args: argparse.Namespace) -> None:
             human_required=[],
             recovery="Provide one adapter JSON object; no file was moved.",
         ))
-        return
     adapter_result = validate_live_adapter(adapter, Path(args.workspace))
     if adapter_result["result"] != "pass":
-        emit({
+        return emit({
             "result": "fail",
             "mechanical_findings": adapter_result["mechanical_findings"],
             "semantic_findings": [],
@@ -4169,11 +5080,10 @@ def controlled_archive_command(args: argparse.Namespace) -> None:
             "receipt_output": None,
             "recovery": "Fix adapter findings before requesting controlled archive intake.",
         })
-        return
     try:
         request = json.loads(Path(args.request).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
-        emit({
+        return emit({
             "result": "fail",
             "mechanical_findings": [{
                 "code": "invalid-archive-request-file",
@@ -4188,9 +5098,8 @@ def controlled_archive_command(args: argparse.Namespace) -> None:
             "receipt_output": None,
             "recovery": "Provide one valid controlled archive request JSON file.",
         })
-        return
     if not isinstance(request, dict):
-        emit({
+        return emit({
             "result": "fail",
             "mechanical_findings": [{
                 "code": "invalid-archive-request",
@@ -4204,7 +5113,6 @@ def controlled_archive_command(args: argparse.Namespace) -> None:
             "receipt_output": None,
             "recovery": "Provide one controlled archive request object.",
         })
-        return
     execution_grant = None
     amendment = None
     original_execution_grant = None
@@ -4234,8 +5142,7 @@ def controlled_archive_command(args: argparse.Namespace) -> None:
                 ),
             )
             payload["normalized_result"] = normalize_archive_result(payload)
-            emit(payload)
-            return
+            return emit(payload)
         if not isinstance(loaded, dict):
             payload = archive_failure(
                 result="fail",
@@ -4251,8 +5158,7 @@ def controlled_archive_command(args: argparse.Namespace) -> None:
                 ),
             )
             payload["normalized_result"] = normalize_archive_result(payload)
-            emit(payload)
-            return
+            return emit(payload)
         if field == "execution_grant":
             execution_grant = loaded
         elif field == "amendment":
@@ -4290,7 +5196,7 @@ def controlled_archive_command(args: argparse.Namespace) -> None:
         )
     if "normalized_result" not in payload:
         payload["normalized_result"] = normalize_archive_result(payload)
-    emit(payload)
+    return emit(payload)
 
 
 def _archive_task_preflight_payload(
@@ -4341,7 +5247,7 @@ def _archive_task_preflight_payload(
                 "result": "pass",
                 "phase": "receipt-reconciliation",
                 "task_operation_id": operation["id"],
-                "request_sha256": archive_protocol_digest(request),
+                "request_sha256": canonical_archive_v1_digest(request),
                 "mapping": mapping,
                 "preflight_sha256": (
                     receipt.get("execution", {})
@@ -4474,7 +5380,7 @@ def _archive_task_preflight_payload(
     payload["mechanical_findings"].extend(output_findings)
     if output_findings:
         payload["result"] = "fail"
-    payload["preflight_sha256"] = archive_protocol_digest({
+    payload["preflight_sha256"] = canonical_archive_v1_digest({
         "base_preflight_sha256": payload["preflight_sha256"],
         "task_summary_binding": output_binding,
         "output_findings": output_findings,
@@ -4523,21 +5429,19 @@ def _load_archive_task_receipts(
     return receipts, findings
 
 
-def archive_task_command(args: argparse.Namespace) -> None:
+def archive_task_command(args: argparse.Namespace) -> int:
     try:
         adapter, missing = load_json_or_missing(Path(args.adapter))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        emit(structured_archive_exception(
+        return emit(structured_archive_exception(
             exc,
             phase="task-adapter-input",
             mapping=None,
         ))
-        return
     if missing:
-        emit(missing)
-        return
+        return emit(missing)
     if not isinstance(adapter, dict):
-        emit({
+        return emit({
             "result": "fail",
             "phase": "task-adapter-preflight",
             "mechanical_findings": [{
@@ -4548,10 +5452,9 @@ def archive_task_command(args: argparse.Namespace) -> None:
             "atomicity": "none-read-only",
             "recovery": "Provide one adapter JSON object; no file was moved.",
         })
-        return
     adapter_result = validate_live_adapter(adapter, Path(args.workspace))
     if adapter_result["result"] != "pass":
-        emit({
+        return emit({
             "result": "fail",
             "phase": "task-adapter-preflight",
             "mechanical_findings": adapter_result["mechanical_findings"],
@@ -4562,12 +5465,11 @@ def archive_task_command(args: argparse.Namespace) -> None:
                 "execution; no file was moved."
             ),
         })
-        return
     workspace = Path(args.workspace).resolve()
     try:
         manifest = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        emit({
+        return emit({
             "result": "fail",
             "phase": "task-preflight",
             "mechanical_findings": [{
@@ -4579,9 +5481,8 @@ def archive_task_command(args: argparse.Namespace) -> None:
             "atomicity": "none-read-only",
             "recovery": "Provide one valid archive task manifest; no file was moved.",
         })
-        return
     if not isinstance(manifest, dict):
-        emit({
+        return emit({
             "result": "fail",
             "phase": "task-preflight",
             "mechanical_findings": [{
@@ -4592,7 +5493,6 @@ def archive_task_command(args: argparse.Namespace) -> None:
             "atomicity": "none-read-only",
             "recovery": "Provide one archive task object; no file was moved.",
         })
-        return
 
     receipts, receipt_findings = _load_archive_task_receipts(
         workspace,
@@ -4634,8 +5534,7 @@ def archive_task_command(args: argparse.Namespace) -> None:
             summary["result"] = "fail"
         summary["preflight"] = preflight
         summary["normalized_result"] = normalize_archive_result(summary)
-        emit(summary)
-        return
+        return emit(summary)
 
     preflight, operation_preflights = _archive_task_preflight_payload(
         adapter,
@@ -4650,16 +5549,14 @@ def archive_task_command(args: argparse.Namespace) -> None:
             preflight["mechanical_findings"].extend(receipt_findings)
             preflight["result"] = "fail"
             preflight["normalized_result"] = normalize_archive_result(preflight)
-        emit(preflight)
-        return
+        return emit(preflight)
 
     if preflight["result"] != "pass":
-        emit(preflight)
-        return
+        return emit(preflight)
     try:
         grant = json.loads(Path(args.execution_grant).read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        emit({
+        return emit({
             "result": "fail",
             "phase": "task-execution",
             "mechanical_findings": [{
@@ -4671,7 +5568,6 @@ def archive_task_command(args: argparse.Namespace) -> None:
             "atomicity": "non-atomic-independent-operations",
             "recovery": "Provide the exact task execution grant; no pending file was moved.",
         })
-        return
     operation_ids = [
         item.get("id")
         for item in manifest.get("operations", [])
@@ -4727,7 +5623,7 @@ def archive_task_command(args: argparse.Namespace) -> None:
                         "field": field,
                     })
     if grant_findings or grant_unverified:
-        emit({
+        return emit({
             "result": "fail" if grant_findings else "unproven",
             "phase": "task-execution",
             "mechanical_findings": grant_findings,
@@ -4739,7 +5635,6 @@ def archive_task_command(args: argparse.Namespace) -> None:
                 "preflight, and complete operation set."
             ),
         })
-        return
 
     summary_destination = None
     if args.write_summary:
@@ -4765,7 +5660,7 @@ def archive_task_command(args: argparse.Namespace) -> None:
                 "path": str(summary_destination.parent),
             })
         if summary_findings or summary_destination is None:
-            emit({
+            return emit({
                 "result": "fail",
                 "phase": "task-execution-preflight",
                 "mechanical_findings": summary_findings,
@@ -4777,7 +5672,6 @@ def archive_task_command(args: argparse.Namespace) -> None:
                     "no file was moved."
                 ),
             })
-            return
 
     operation_grants = grant["operation_grants"]
     results: list[dict] = []
@@ -4924,13 +5818,20 @@ def archive_task_command(args: argparse.Namespace) -> None:
         )
     summary["authorization_state"] = "exact-task-grant-bound"
     summary["global_preflight_sha256"] = preflight["preflight_sha256"]
-    summary["task_grant_sha256"] = archive_protocol_digest(grant)
+    summary["task_grant_sha256"] = canonical_archive_v1_digest(grant)
     summary["previous_summary_sha256"] = preflight.get(
         "task_summary_binding",
         {},
     ).get("previous_summary_sha256")
     summary["receipt_bindings"] = []
+    verified_operation_ids = {
+        item.get("id")
+        for item in summary["operations"]
+        if item.get("state") == "completed-receipt-verified"
+    }
     for operation in manifest["operations"]:
+        if operation["id"] not in verified_operation_ids:
+            continue
         receipt_path = workspace / operation["receipt"]
         if receipt_path.is_file() and not receipt_path.is_symlink():
             summary["receipt_bindings"].append({
@@ -4938,6 +5839,11 @@ def archive_task_command(args: argparse.Namespace) -> None:
                 "path": operation["receipt"],
                 "sha256": file_digest(receipt_path),
             })
+    summary["execution_results"] = compact_archive_task_execution_results(
+        results,
+        summary["receipt_bindings"],
+    )
+    summary["execution_results_mode"] = "receipt-references-for-success"
     summary["normalized_result"] = normalize_archive_result(summary)
     if summary_destination is not None:
         try:
@@ -4951,17 +5857,16 @@ def archive_task_command(args: argparse.Namespace) -> None:
             })
             summary["result"] = "fail"
     summary["normalized_result"] = normalize_archive_result(summary)
-    emit(summary)
+    return emit(summary)
 
 
-def archive_authorization_status_command(args: argparse.Namespace) -> None:
+def archive_authorization_status_command(args: argparse.Namespace) -> int:
     adapter, missing = load_json_or_missing(Path(args.adapter))
     if missing:
-        emit(missing)
-        return
+        return emit(missing)
     validation = validate_live_adapter(adapter, Path(args.workspace))
     if validation["result"] != "pass":
-        emit({
+        return emit({
             "result": "fail",
             "mechanical_findings": validation["mechanical_findings"],
             "semantic_findings": [],
@@ -4972,21 +5877,20 @@ def archive_authorization_status_command(args: argparse.Namespace) -> None:
                 "reading archive authorization lifecycle status."
             ),
         })
-        return
     payload = archive_authorization_lifecycle(
         adapter,
         Path(args.workspace).resolve(),
         authorization_id=args.authorization_id,
     )
     payload["normalized_result"] = normalize_archive_result(payload)
-    emit(payload)
+    return emit(payload)
 
 
-def normalize_archive_result_command(args: argparse.Namespace) -> None:
+def normalize_archive_result_command(args: argparse.Namespace) -> int:
     try:
         payload = json.loads(Path(args.input).read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        emit({
+        return emit({
             "schema": "govern-ai-coding.normalized-result.v1",
             "schema_version": "1",
             "verdict": "unproven",
@@ -5002,20 +5906,23 @@ def normalize_archive_result_command(args: argparse.Namespace) -> None:
             }],
             "recovery": "Provide one readable JSON result or receipt.",
         })
-        return
-    emit(normalize_archive_result(payload))
+    return emit(normalize_archive_result(payload))
 
 
-def freeze_command(args: argparse.Namespace) -> None:
+def freeze_command(args: argparse.Namespace) -> int:
     manifest, manifest_findings = prepare_event_manifest(args, phase="freeze")
+    manifest_expected_digest = (
+        args.event_manifest_expected_digest
+        if event_manifest_is_v2(manifest)
+        else None
+    )
     adapter, missing = load_json_or_missing(Path(args.adapter))
     if missing:
         missing["freeze_receipt"] = None
-        emit(missing)
-        return
+        return emit(missing)
     adapter_result = validate_live_adapter(adapter, Path(args.workspace))
     if adapter_result["result"] == "fail":
-        emit({
+        return emit({
             "result": "fail",
             "freeze_receipt": None,
             "mechanical_findings": adapter_result["mechanical_findings"],
@@ -5023,9 +5930,16 @@ def freeze_command(args: argparse.Namespace) -> None:
             "human_approval_required": [],
             "recovery": "Freeze cannot run until the project adapter validates.",
         })
-        return
 
     workspace = Path(args.workspace).resolve()
+    if manifest is not None:
+        manifest, contextual_findings = validate_event_manifest(
+            manifest,
+            manifest_path=Path(args.event_manifest),
+            workspace=workspace,
+            adapter=adapter,
+        )
+        manifest_findings.extend(contextual_findings)
     snapshots, findings = snapshot_declared_paths(workspace, args.changed_path)
     findings.extend(manifest_findings)
     if not args.changed_path:
@@ -5074,9 +5988,10 @@ def freeze_command(args: argparse.Namespace) -> None:
                 args.event_manifest,
                 workspace,
                 adapter,
+                expected_digest=manifest_expected_digest,
             )
         )
-    emit({
+    return emit({
         "result": "fail" if findings else "pass",
         "freeze_receipt": receipt,
         "receipt_output": output_path,
@@ -6236,6 +7151,356 @@ def semantic_review_shape_finding(
     }
 
 
+def validate_semantic_review_shape(
+    review: object,
+    review_path: str,
+) -> tuple[dict, list[dict]]:
+    mechanical: list[dict] = []
+    if not isinstance(review, dict):
+        mechanical.append(semantic_review_shape_finding(
+            review_path,
+            field="root",
+            expected="JSON object",
+            actual=review,
+        ))
+        review = {}
+
+    if review.get("schema") != "govern-ai-coding.semantic-review.v1":
+        mechanical.append(semantic_review_shape_finding(
+            review_path,
+            field="schema",
+            expected="govern-ai-coding.semantic-review.v1",
+            actual=review.get("schema"),
+            actual_type=str(review.get("schema")),
+        ))
+
+    answers = review.get("answers")
+    if not isinstance(answers, dict):
+        mechanical.append(semantic_review_shape_finding(
+            review_path,
+            field="answers",
+            expected="object",
+            actual=answers,
+        ))
+        answers = {}
+    normalized_answers: dict[str, object] = {}
+    for key in sorted(SEMANTIC_ANSWER_KEYS):
+        value = answers.get(key)
+        valid = (
+            isinstance(value, str) and bool(value.strip())
+        ) or (
+            isinstance(value, list)
+            and bool(value)
+            and all(isinstance(item, str) and bool(item.strip()) for item in value)
+        )
+        if not valid:
+            mechanical.append(semantic_review_shape_finding(
+                review_path,
+                field=f"answers.{key}",
+                expected="non-empty string or non-empty string list",
+                actual=value,
+            ))
+        else:
+            normalized_answers[key] = value
+
+    raw_findings = review.get("findings")
+    if not isinstance(raw_findings, list):
+        mechanical.append(semantic_review_shape_finding(
+            review_path,
+            field="findings",
+            expected="array",
+            actual=raw_findings,
+        ))
+        raw_findings = []
+
+    normalized_findings: list[dict] = []
+    for index, finding in enumerate(raw_findings):
+        if not isinstance(finding, dict):
+            mechanical.append(semantic_review_shape_finding(
+                review_path,
+                field=f"findings[{index}]",
+                expected="object",
+                actual=finding,
+            ))
+            continue
+        malformed = False
+        for key in sorted(SEMANTIC_FINDING_KEYS):
+            value = finding.get(key)
+            valid = (
+                isinstance(value, bool)
+                if key == "human_boundary"
+                else isinstance(value, str) and bool(value.strip())
+            )
+            if not valid:
+                mechanical.append(semantic_review_shape_finding(
+                    review_path,
+                    field=f"findings[{index}].{key}",
+                    expected="boolean" if key == "human_boundary" else "non-empty string",
+                    actual=value,
+                ))
+                malformed = True
+        status = finding.get("status")
+        if isinstance(status, str) and status not in {"resolved", "unresolved"}:
+            mechanical.append(semantic_review_shape_finding(
+                review_path,
+                field=f"findings[{index}].status",
+                expected="resolved or unresolved",
+                actual=status,
+                actual_type=status,
+            ))
+            malformed = True
+        if status == "resolved":
+            for field in ("resolution", "resolution_evidence"):
+                value = finding.get(field)
+                if not isinstance(value, str) or not value.strip():
+                    mechanical.append(semantic_review_shape_finding(
+                        review_path,
+                        field=f"findings[{index}].{field}",
+                        expected="non-empty string",
+                        actual=value,
+                    ))
+                    malformed = True
+        elif status == "unresolved":
+            for field in ("resolution", "resolution_evidence"):
+                if field in finding and (
+                    not isinstance(finding[field], str) or not finding[field].strip()
+                ):
+                    mechanical.append(semantic_review_shape_finding(
+                        review_path,
+                        field=f"findings[{index}].{field}",
+                        expected="non-empty string when supplied",
+                        actual=finding[field],
+                    ))
+                    malformed = True
+        if not malformed:
+            normalized_findings.append(finding)
+
+    return {
+        "schema": review.get("schema"),
+        "source": review.get("source"),
+        "answers": normalized_answers,
+        "findings": normalized_findings,
+    }, mechanical
+
+
+def validate_semantic_review_command(args: argparse.Namespace) -> int:
+    review_path = str(args.review)
+    try:
+        review, input_finding = load_json_object(
+            Path(args.review),
+            input_name="semantic-review",
+            category="semantic_review",
+        )
+    except FileNotFoundError:
+        review = None
+        input_finding = {"actual": "missing"}
+    if input_finding is not None:
+        normalized = {
+            "schema": None,
+            "source": None,
+            "answers": {},
+            "findings": [],
+        }
+        findings = [semantic_review_shape_finding(
+            review_path,
+            field="root",
+            expected="readable UTF-8 JSON object",
+            actual=input_finding.get("actual"),
+            actual_type=str(input_finding.get("actual")),
+        )]
+    else:
+        normalized, findings = validate_semantic_review_shape(
+            review,
+            review_path,
+        )
+    result = "fail" if findings else "pass"
+    return emit({
+        "result": result,
+        "semantic_review": {
+            "status": "malformed" if findings else "valid-shape",
+            "source": review_path,
+            **normalized,
+        },
+        "mechanical_findings": findings,
+        "semantic_findings": [],
+        "human_approval_required": [],
+        "claim_boundary": {
+            "shape_validated": not findings,
+            "context_bound": False,
+            "does_not_prove": [
+                "resolution evidence belongs to the governed event",
+                "review findings are resolved in Closeout context",
+                "human approval, product acceptance, release, or readiness",
+            ],
+        },
+        "recovery": (
+            "Correct only the reported Semantic Review shape fields and rerun this preflight."
+            if findings
+            else "Bind this review to Closeout for event-context and resolution-evidence checks."
+        ),
+    })
+
+
+def load_command_json_object(
+    path: Path,
+    *,
+    input_name: str,
+    category: str,
+) -> tuple[dict | None, list[dict]]:
+    try:
+        value, finding = load_json_object(
+            path,
+            input_name=input_name,
+            category=category,
+        )
+    except FileNotFoundError:
+        return None, [{
+            "code": f"{input_name}-missing",
+            "severity": "blocking",
+            "category": category,
+            "message": f"{input_name} does not exist: {path}",
+            "field": input_name,
+            "path": str(path),
+            "expected": "readable UTF-8 JSON object",
+            "actual": "missing",
+            "recovery_actions": [
+                f"Restore the exact {input_name} input and rerun only this command."
+            ],
+        }]
+    return value, [finding] if finding is not None else []
+
+
+def build_validation_receipt_command(args: argparse.Namespace) -> int:
+    adapter, missing = load_json_or_missing(Path(args.adapter))
+    if missing:
+        missing.update({
+            "validation_receipt": None,
+            "receipt_output": None,
+            "execution": {"performed": False},
+        })
+        return emit(missing)
+
+    workspace = Path(args.workspace)
+    adapter_result = validate_live_adapter(adapter, workspace)
+    if adapter_result["result"] == "fail":
+        return emit({
+            "result": "fail",
+            "validation_receipt": None,
+            "receipt_output": None,
+            "mechanical_findings": adapter_result["mechanical_findings"],
+            "semantic_findings": [],
+            "human_approval_required": [],
+            "execution": {"performed": False},
+            "recovery": "Repair the adapter or live navigation entrypoint and retry.",
+        })
+
+    freeze, freeze_findings = load_command_json_object(
+        Path(args.freeze),
+        input_name="freeze-receipt",
+        category="receipt_format",
+    )
+    facts, facts_findings = load_command_json_object(
+        Path(args.facts),
+        input_name="validation-facts",
+        category="validation_evidence",
+    )
+    findings = freeze_findings + facts_findings
+    receipt = None
+    if not findings:
+        receipt, build_findings = build_evidence_validation_receipt(
+            freeze,
+            facts,
+        )
+        findings.extend(build_findings)
+
+    output_path = None
+    if receipt is not None and not findings:
+        output_path, write_findings = write_receipt_file(
+            receipt,
+            args.write_receipt,
+            workspace,
+            adapter,
+            overwrite=False,
+        )
+        findings.extend(write_findings)
+
+    result = "fail" if findings else "pass"
+    return emit({
+        "result": result,
+        "validation_receipt": receipt,
+        "receipt_output": output_path,
+        "mechanical_findings": findings,
+        "semantic_findings": [],
+        "human_approval_required": [],
+        "execution": {
+            "performed": False,
+            "recorded_commands_executed": False,
+        },
+        "claim_boundary": {
+            "facts_copied": receipt is not None,
+            "does_not_prove": [
+                "recorded commands were executed by this command",
+                "test framework output was parsed or independently verified",
+                "human approval, product acceptance, release, or readiness",
+            ],
+        },
+        "recovery": (
+            "Correct only the reported input or output issue and rerun this builder."
+            if findings
+            else "Bind this receipt to its exact Freeze in validation and Closeout."
+        ),
+    })
+
+
+def validate_validation_receipt_command(args: argparse.Namespace) -> int:
+    receipt_path = Path(args.receipt)
+    receipt, receipt_findings = load_command_json_object(
+        receipt_path,
+        input_name="validation-receipt",
+        category="validation_evidence",
+    )
+    freeze, freeze_findings = load_command_json_object(
+        Path(args.freeze),
+        input_name="freeze-receipt",
+        category="receipt_format",
+    )
+    findings = receipt_findings + freeze_findings
+    if not findings:
+        validation_report = validate_validation_receipt_for_profile(
+            receipt,
+            receipt_path,
+            profile="standalone-freeze-bound-v1",
+            freeze=freeze,
+        )
+        findings.extend(validation_report["findings"])
+    result = "fail" if findings else "pass"
+    return emit({
+        "result": result,
+        "validation_receipt": {
+            "status": "invalid" if findings else "valid",
+            "source": str(receipt_path),
+            "freeze_source": str(args.freeze),
+        },
+        "mechanical_findings": findings,
+        "semantic_findings": [],
+        "human_approval_required": [],
+        "execution": {"performed": False},
+        "claim_boundary": {
+            "structure_validated": not findings,
+            "freeze_bound": not findings,
+            "does_not_prove": [
+                "recorded commands were executed by this command",
+                "human approval, product acceptance, release, or readiness",
+            ],
+        },
+        "recovery": (
+            "Correct only the reported receipt or Freeze mismatch and rerun validation."
+            if findings
+            else "Use this exact receipt and Freeze together in Closeout."
+        ),
+    })
+
+
 def evaluate_semantic_review(
     review_path: str | None,
     *,
@@ -6279,90 +7544,28 @@ def evaluate_semantic_review(
             actual_type=str(input_finding.get("actual")),
         )], [], []
 
-    answers = review.get("answers")
-    if not isinstance(answers, dict):
-        mechanical.append(semantic_review_shape_finding(
-            review_path,
-            field="answers",
-            expected="object",
-            actual=answers,
-        ))
-        answers = {}
-    for key in sorted(SEMANTIC_ANSWER_KEYS):
-        value = answers.get(key)
-        valid = (
-            isinstance(value, str) and bool(value.strip())
-        ) or (
-            isinstance(value, list)
-            and bool(value)
-            and all(isinstance(item, str) and bool(item.strip()) for item in value)
-        )
-        if not valid:
-            mechanical.append(semantic_review_shape_finding(
-                review_path,
-                field=f"answers.{key}",
-                expected="non-empty string or non-empty string list",
-                actual=value,
-            ))
-    findings = review.get("findings")
-    if not isinstance(findings, list):
-        mechanical.append(semantic_review_shape_finding(
-            review_path,
-            field="findings",
-            expected="array",
-            actual=findings,
-        ))
-        findings = []
+    normalized_review, shape_findings = validate_semantic_review_shape(
+        review,
+        review_path,
+    )
+    mechanical.extend(shape_findings)
+    answers = normalized_review["answers"]
+    findings = normalized_review["findings"]
 
     normalized_event = set(event_paths)
     normalized_authorized, auth_findings = normalize_paths_with_findings(authorized_docs, "authorized_doc")
     mechanical.extend(auth_findings)
     semantic_findings = []
-    for index, finding in enumerate(findings):
-        if not isinstance(finding, dict):
-            mechanical.append(semantic_review_shape_finding(
-                review_path,
-                field=f"findings[{index}]",
-                expected="object",
-                actual=finding,
-            ))
-            continue
-        malformed_finding = False
-        for key in sorted(SEMANTIC_FINDING_KEYS):
-            value = finding.get(key)
-            valid = (
-                isinstance(value, bool)
-                if key == "human_boundary"
-                else isinstance(value, str) and bool(value.strip())
-            )
-            if not valid:
-                mechanical.append(semantic_review_shape_finding(
-                    review_path,
-                    field=f"findings[{index}].{key}",
-                    expected="boolean" if key == "human_boundary" else "non-empty string",
-                    actual=value,
-                ))
-                malformed_finding = True
-        if malformed_finding:
-            continue
+    for finding in findings:
         semantic_findings.append(finding)
         status = finding.get("status")
         if status == "unresolved":
             unverified.append("unresolved-semantic-finding")
             continue
-        if status != "resolved":
-            mechanical.append(semantic_review_shape_finding(
-                review_path,
-                field=f"findings[{index}].status",
-                expected="resolved or unresolved",
-                actual=status,
-                actual_type=str(status),
-            ))
-            continue
-        if not finding.get("resolution") or not finding.get("resolution_evidence"):
-            unverified.append("semantic-resolution-evidence-missing")
-            continue
-        evidence, evidence_finding = normalize_path_value(str(finding.get("resolution_evidence")), "semantic_resolution_evidence")
+        evidence, evidence_finding = normalize_path_value(
+            finding["resolution_evidence"],
+            "semantic_resolution_evidence",
+        )
         if evidence_finding:
             mechanical.append(evidence_finding)
             continue
@@ -6377,7 +7580,7 @@ def evaluate_semantic_review(
         "source": str(review_path),
         "binding": {
             "source": str(review_path),
-            "digest": canonical_json_digest(review),
+            "digest": canonical_evidence_v1_digest(review),
         },
         "answers": answers if isinstance(answers, dict) else {},
         "findings": semantic_findings,
@@ -7243,15 +8446,6 @@ def add_structured_diagnostics(payload: dict) -> dict:
     return payload
 
 
-def canonical_json_digest(payload: object) -> str:
-    encoded = json.dumps(
-        payload,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
-
-
 def receipt_payload_from_args(
     args: argparse.Namespace,
     *,
@@ -7413,8 +8607,8 @@ def evaluate_work_map_closeout(
         external_impact_receipt is not None
         and (
             external_impact_receipt != manifest_impact_receipt
-            or canonical_json_digest(external_impact_receipt)
-            != canonical_json_digest(manifest_impact_receipt)
+            or canonical_evidence_v1_digest(external_impact_receipt)
+            != canonical_evidence_v1_digest(manifest_impact_receipt)
         )
     ):
         findings.append({
@@ -7515,20 +8709,98 @@ def write_closeout_attestation(
     return {
         "status": "created",
         "path": str(destination),
-        "digest": canonical_json_digest(attestation),
+        "digest": canonical_evidence_v1_digest(attestation),
         "schema": CLOSEOUT_ATTESTATION_SCHEMA,
     }, []
 
 
-def closeout_command(args: argparse.Namespace) -> None:
+def event_manifest_v2_closeout_input_findings(
+    manifest: dict | None,
+    *,
+    attempt_id: str | None,
+    write_receipt: str | None,
+) -> list[dict]:
+    if not event_manifest_is_v2(manifest):
+        if attempt_id is not None:
+            return [{"code": "event-manifest-attempt-id-v1-unsupported"}]
+        return []
+    findings: list[dict] = []
+    if attempt_id is None:
+        findings.append({"code": "event-manifest-attempt-id-required"})
+    elif re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", attempt_id) is None:
+        findings.append({
+            "code": "event-manifest-attempt-id-invalid",
+            "attempt_id": attempt_id,
+        })
+    elif any(
+        isinstance(item, dict) and item.get("id") == attempt_id
+        for item in manifest.get("closeout", {}).get("attempts", [])
+    ):
+        findings.append({
+            "code": "event-manifest-attempt-id-duplicate",
+            "attempt_id": attempt_id,
+        })
+    if not write_receipt:
+        findings.append({"code": "event-manifest-attempt-receipt-required"})
+    return findings
+
+
+def closeout_not_run_payload(
+    args: argparse.Namespace,
+    findings: list[dict],
+) -> dict:
+    return add_structured_closeout_recovery({
+        "result": "fail",
+        "coverage": {
+            "workspace_mode": "live",
+            "unverified": ["closeout-not-run"],
+        },
+        "closeout": {
+            "mode": "live",
+            "workspace": args.workspace,
+            "changed_paths": args.changed_path,
+            "actual_paths": args.actual_path,
+            "authorized_docs": args.authorized_paths,
+            "authorized_paths": args.authorized_paths,
+            "protected_approvals": [],
+            "verified_human_approvals": [],
+        },
+        "mechanical_findings": findings,
+        "semantic_review": {
+            "status": "not run",
+            "required": bool(args.require_semantic_review),
+            "findings": [],
+        },
+        "semantic_findings": [],
+        "human_approval_required": [],
+        "closeout_receipt": None,
+        "receipt_output": None,
+        "attestation": {"status": "not-created", "reason": "closeout-not-run"},
+        "recovery": "Correct the Event Manifest Closeout inputs and retry.",
+    })
+
+
+def closeout_command(args: argparse.Namespace) -> int:
     manifest, manifest_findings = prepare_event_manifest(args, phase="closeout")
+    manifest_expected_digest = args.event_manifest_expected_digest
     compatibility_warnings = []
     if args.authorized_doc:
         compatibility_warnings.append({
             "code": "authorized-doc-deprecated",
             "message": "--authorized-doc is a compatibility alias; use --authorized-path.",
         })
-    args.authorized_paths = sorted(set(args.authorized_path + args.authorized_doc))
+    loaded_authorized_paths: list[str] = []
+    authorized_path_findings: list[dict] = []
+    for path_file in args.authorized_paths_from:
+        loaded_paths, path_findings = load_paths_from(path_file)
+        loaded_authorized_paths.extend(loaded_paths)
+        authorized_path_findings.extend(path_findings)
+    manifest_findings.extend(authorized_path_findings)
+    args.authorized_paths = sorted(set(
+        args.authorized_path
+        + args.authorized_doc
+        + loaded_authorized_paths
+    ))
     if manifest is not None:
         args.impact_receipt_payload = manifest["receipts"].get("impact")
         args.freeze_receipt_payload = manifest["receipts"].get("freeze")
@@ -7549,6 +8821,42 @@ def closeout_command(args: argparse.Namespace) -> None:
                 args.protected_approval.append(
                     f"{approval.get('path', '')}={approval.get('evidence', '')}"
                 )
+    if authorized_path_findings:
+        return emit(add_structured_closeout_recovery({
+            "result": "fail",
+            "coverage": {
+                "workspace_mode": "live",
+                "unverified": ["closeout-not-run"],
+            },
+            "closeout": {
+                "mode": "live",
+                "workspace": args.workspace,
+                "changed_paths": args.changed_path,
+                "actual_paths": args.actual_path,
+                "authorized_docs": args.authorized_paths,
+                "authorized_paths": args.authorized_paths,
+                "protected_approvals": [],
+                "verified_human_approvals": [],
+            },
+            "mechanical_findings": authorized_path_findings,
+            "semantic_review": {
+                "status": "not run",
+                "required": bool(args.require_semantic_review),
+                "findings": [],
+            },
+            "semantic_findings": [],
+            "human_approval_required": [],
+            "closeout_receipt": None,
+            "receipt_output": None,
+            "attestation": {
+                "status": "not-created",
+                "reason": "authorized-paths-input-invalid",
+            },
+            "recovery": (
+                "Correct only the reported authorization path file input; "
+                "no receipt or attestation was written."
+            ),
+        }))
     live_requested = bool(
         args.changed_path
         or args.receipt
@@ -7563,6 +8871,9 @@ def closeout_command(args: argparse.Namespace) -> None:
     if live_requested:
         adapter, missing = load_json_or_missing(Path(args.adapter))
         if missing:
+            if authorized_path_findings:
+                missing["result"] = "fail"
+                missing["mechanical_findings"].extend(authorized_path_findings)
             missing["closeout"] = {
                 "mode": "live",
                 "workspace": args.workspace,
@@ -7578,11 +8889,10 @@ def closeout_command(args: argparse.Namespace) -> None:
                 "required": bool(args.require_semantic_review),
                 "findings": [],
             }
-            emit(add_structured_closeout_recovery(missing))
-            return
+            return emit(add_structured_closeout_recovery(missing))
         live_validation = validate_live_adapter(adapter, Path(args.workspace))
         if live_validation["result"] != "pass":
-            emit(add_structured_closeout_recovery({
+            return emit(add_structured_closeout_recovery({
                 "result": "fail",
                 "coverage": {
                     "workspace_mode": "live",
@@ -7617,7 +8927,23 @@ def closeout_command(args: argparse.Namespace) -> None:
                     "Closeout; no receipt or attestation was written."
                 ),
             }))
-            return
+        if manifest is not None:
+            manifest, contextual_findings = validate_event_manifest(
+                manifest,
+                manifest_path=Path(args.event_manifest),
+                workspace=Path(args.workspace),
+                adapter=adapter,
+            )
+            manifest_findings.extend(contextual_findings)
+        if args.event_manifest and manifest is None and manifest_findings:
+            return emit(closeout_not_run_payload(args, manifest_findings))
+        v2_input_findings = event_manifest_v2_closeout_input_findings(
+            manifest,
+            attempt_id=args.attempt_id,
+            write_receipt=args.write_receipt,
+        )
+        if v2_input_findings:
+            return emit(closeout_not_run_payload(args, v2_input_findings))
         payload = live_closeout(
             adapter,
             Path(args.workspace),
@@ -7646,14 +8972,19 @@ def closeout_command(args: argparse.Namespace) -> None:
         if manifest is not None:
             validation_receipts.extend(manifest["receipts"].get("validation", []))
         freeze_payload = receipt_payload_from_args(args, kind="freeze")
-        validation_evidence, validation_findings = collect_validation_evidence(
-            validation_receipts,
-            Path(args.workspace),
-            freeze_receipt=freeze_payload,
-            require_freeze_binding=(
-                manifest is not None
-                and manifest.get("work_map_binding") is not None
-            ),
+        validation_profile = (
+            "work-map-closeout-v1"
+            if manifest is not None
+            and manifest.get("work_map_binding") is not None
+            else "closeout-compatible-v1"
+        )
+        validation_evidence, validation_findings = (
+            collect_validation_evidence_for_profile(
+                validation_receipts,
+                Path(args.workspace),
+                profile=validation_profile,
+                freeze_receipt=freeze_payload,
+            )
         )
         if validation_findings:
             payload["mechanical_findings"].extend(validation_findings)
@@ -7667,85 +8998,257 @@ def closeout_command(args: argparse.Namespace) -> None:
             finding.get("code") == "work-map-impact-receipt-output-alias"
             for finding in work_map_findings
         )
-        if args.write_receipt and not impact_receipt_output_alias:
-            output_path, write_findings = write_receipt_file(
-                payload["closeout_receipt"],
-                args.write_receipt,
-                Path(args.workspace),
-                adapter,
-            )
-            payload["receipt_output"] = output_path
-            if write_findings:
-                payload["mechanical_findings"].extend(write_findings)
-                payload["result"] = "fail"
-                payload["closeout_receipt"]["result"] = "fail"
-        elif args.write_receipt:
-            payload["receipt_output"] = None
         if payload["result"] == "pass" and work_map_observation is not None:
             payload["work_map_observation"] = work_map_observation
         else:
             payload.pop("work_map_observation", None)
         payload = add_structured_closeout_recovery(payload)
-        if args.write_attestation:
-            if payload["result"] == "pass":
-                attestation = build_evidence_attestation(
-                    payload,
-                    adapter=adapter,
-                    workspace=Path(args.workspace),
-                    manifest=manifest,
-                    impact_receipt=receipt_payload_from_args(
-                        args, kind="impact",
-                    ),
-                    freeze_receipt=freeze_payload,
-                    validation_evidence=validation_evidence,
+        if event_manifest_is_v2(manifest):
+            if not isinstance(freeze_payload, dict):
+                payload["mechanical_findings"].append({
+                    "code": "event-manifest-attempt-freeze-required",
+                })
+                payload["result"] = "fail"
+                payload["closeout_receipt"]["result"] = "fail"
+                payload = add_structured_closeout_recovery(payload)
+            else:
+                impact_payload = receipt_payload_from_args(args, kind="impact")
+                if not isinstance(impact_payload, dict):
+                    payload["mechanical_findings"].append({
+                        "code": "event-manifest-attempt-impact-required",
+                    })
+                    payload["result"] = "fail"
+                    payload["closeout_receipt"]["result"] = "fail"
+                    payload = add_structured_closeout_recovery(payload)
+                    impact_payload = {}
+                payload["closeout_receipt"]["freeze"] = {
+                    "schema": "govern-ai-coding.freeze-receipt.v1",
+                    "digest": canonical_evidence_v1_digest(freeze_payload),
+                    "receipt": freeze_payload,
+                }
+                payload["closeout_receipt"]["impact"] = {
+                    "digest": canonical_evidence_v1_digest(impact_payload),
+                    "receipt": impact_payload,
+                }
+                receipt_path, receipt_write_findings = write_or_reuse_json_evidence(
+                    payload["closeout_receipt"],
+                    args.write_receipt,
+                    Path(args.workspace),
+                    adapter,
+                    kind="receipt",
                 )
-                attestation_summary, attestation_findings = write_closeout_attestation(
-                    attestation,
-                    args.write_attestation,
+                payload["receipt_output"] = receipt_path
+                if receipt_write_findings:
+                    payload["mechanical_findings"].extend(receipt_write_findings)
+                    payload["result"] = "fail"
+                    payload = add_structured_closeout_recovery(payload)
+                else:
+                    attestation = None
+                    attestation_path = None
+                    if args.write_attestation and payload["result"] == "pass":
+                        attestation = build_evidence_attestation(
+                            payload,
+                            adapter=adapter,
+                            workspace=Path(args.workspace),
+                            manifest=manifest,
+                            impact_receipt=receipt_payload_from_args(
+                                args, kind="impact",
+                            ),
+                            freeze_receipt=freeze_payload,
+                            validation_evidence=validation_evidence,
+                        )
+                        attestation_path, attestation_findings = (
+                            write_or_reuse_json_evidence(
+                                attestation,
+                                args.write_attestation,
+                                Path(args.workspace),
+                                adapter,
+                                kind="attestation",
+                            )
+                        )
+                        if attestation_findings:
+                            payload["mechanical_findings"].extend(
+                                attestation_findings,
+                            )
+                            payload["result"] = "fail"
+                            payload["attestation"] = {
+                                "status": "not-created",
+                                "path": args.write_attestation,
+                            }
+                            payload = add_structured_closeout_recovery(payload)
+                        else:
+                            payload["attestation"] = {
+                                "status": "created",
+                                "path": attestation_path,
+                                "digest": canonical_evidence_v1_digest(attestation),
+                                "schema": CLOSEOUT_ATTESTATION_SCHEMA,
+                            }
+                    elif args.write_attestation:
+                        payload["attestation"] = {
+                            "status": "not-created",
+                            "path": args.write_attestation,
+                            "reason": "closeout-result-not-pass",
+                        }
+                    if not (
+                        args.write_attestation
+                        and payload.get("attestation", {}).get("status")
+                        == "not-created"
+                        and payload["closeout_receipt"].get("result") == "pass"
+                    ):
+                        validation_paths = list(
+                            manifest["receipts"].get("validation", []),
+                        )
+                        validation_paths.extend(args.validation_receipt)
+                        manifest["receipts"]["validation"] = sorted(
+                            set(validation_paths),
+                        )
+                        candidate, candidate_findings = append_v2_closeout_attempt(
+                            manifest=manifest,
+                            manifest_path=args.event_manifest,
+                            attempt_id=args.attempt_id,
+                            payload=payload,
+                            receipt_path=receipt_path,
+                            attestation=attestation,
+                            attestation_path=attestation_path,
+                            freeze_receipt=freeze_payload,
+                            workspace=Path(args.workspace),
+                            adapter=adapter,
+                        )
+                        if candidate_findings or candidate is None:
+                            payload["mechanical_findings"].extend(candidate_findings)
+                            payload["result"] = "fail"
+                            payload = add_structured_closeout_recovery(payload)
+                        else:
+                            manifest_write_findings = write_event_manifest(
+                                candidate,
+                                args.event_manifest,
+                                Path(args.workspace),
+                                adapter,
+                                expected_digest=manifest_expected_digest,
+                            )
+                            if manifest_write_findings:
+                                payload["mechanical_findings"].extend(
+                                    manifest_write_findings,
+                                )
+                                payload["result"] = "fail"
+                                payload = add_structured_closeout_recovery(payload)
+                            else:
+                                persisted, persisted_findings = load_event_manifest(
+                                    args.event_manifest,
+                                    workspace=Path(args.workspace),
+                                    adapter=adapter,
+                                )
+                                if persisted_findings or persisted is None:
+                                    payload["mechanical_findings"].extend(
+                                        persisted_findings or [{
+                                            "code": "event-manifest-reread-failed",
+                                        }],
+                                    )
+                                    payload["result"] = "fail"
+                                    payload = add_structured_closeout_recovery(payload)
+                                elif not any(
+                                    isinstance(item, dict)
+                                    and item.get("id") == args.attempt_id
+                                    for item in persisted["closeout"]["attempts"]
+                                ):
+                                    payload["mechanical_findings"].append({
+                                        "code": "event-manifest-attempt-reread-missing",
+                                        "attempt_id": args.attempt_id,
+                                    })
+                                    payload["result"] = "fail"
+                                    payload = add_structured_closeout_recovery(payload)
+                                elif payload["closeout_receipt"]["result"] == "pass":
+                                    resolved = current_closeout_attempt(
+                                        persisted,
+                                        manifest_path=Path(args.event_manifest),
+                                        workspace=Path(args.workspace),
+                                        adapter=adapter,
+                                    )
+                                    if (
+                                        resolved.get("status") != "matching"
+                                        or resolved.get("attempt", {}).get("id")
+                                        != args.attempt_id
+                                    ):
+                                        payload["mechanical_findings"].append({
+                                            "code": "event-manifest-current-reread-mismatch",
+                                        })
+                                        payload["result"] = "fail"
+                                        payload = add_structured_closeout_recovery(payload)
+        else:
+            if args.write_receipt and not impact_receipt_output_alias:
+                output_path, write_findings = write_receipt_file(
+                    payload["closeout_receipt"],
+                    args.write_receipt,
                     Path(args.workspace),
                     adapter,
                 )
-                if attestation_findings:
-                    payload["mechanical_findings"].extend(attestation_findings)
+                payload["receipt_output"] = output_path
+                if write_findings:
+                    payload["mechanical_findings"].extend(write_findings)
                     payload["result"] = "fail"
                     payload["closeout_receipt"]["result"] = "fail"
+            elif args.write_receipt:
+                payload["receipt_output"] = None
+            if args.write_attestation:
+                if payload["result"] == "pass":
+                    attestation = build_evidence_attestation(
+                        payload,
+                        adapter=adapter,
+                        workspace=Path(args.workspace),
+                        manifest=manifest,
+                        impact_receipt=receipt_payload_from_args(
+                            args, kind="impact",
+                        ),
+                        freeze_receipt=freeze_payload,
+                        validation_evidence=validation_evidence,
+                    )
+                    attestation_summary, attestation_findings = write_closeout_attestation(
+                        attestation,
+                        args.write_attestation,
+                        Path(args.workspace),
+                        adapter,
+                    )
+                    if attestation_findings:
+                        payload["mechanical_findings"].extend(attestation_findings)
+                        payload["result"] = "fail"
+                        payload["closeout_receipt"]["result"] = "fail"
+                        payload["attestation"] = {
+                            "status": "not-created",
+                            "path": args.write_attestation,
+                        }
+                        payload = add_structured_closeout_recovery(payload)
+                    else:
+                        payload["attestation"] = attestation_summary
+                else:
                     payload["attestation"] = {
                         "status": "not-created",
                         "path": args.write_attestation,
+                        "reason": "closeout-result-not-pass",
                     }
-                    payload = add_structured_closeout_recovery(payload)
-                else:
-                    payload["attestation"] = attestation_summary
-            else:
-                payload["attestation"] = {
-                    "status": "not-created",
-                    "path": args.write_attestation,
-                    "reason": "closeout-result-not-pass",
+            if manifest is not None:
+                validation_receipts = list(manifest["receipts"].get("validation", []))
+                validation_receipts.extend(args.validation_receipt)
+                manifest["receipts"]["validation"] = sorted(set(validation_receipts))
+                manifest["closeout"] = {
+                    "result": payload["result"],
+                    "result_reasons": list(payload.get("result_reasons", [])),
+                    "recovery_actions": list(payload.get("recovery_actions", [])),
                 }
-        if manifest is not None:
-            validation_receipts = list(manifest["receipts"].get("validation", []))
-            validation_receipts.extend(args.validation_receipt)
-            manifest["receipts"]["validation"] = sorted(set(validation_receipts))
-            manifest["closeout"] = {
-                "result": payload["result"],
-                "result_reasons": list(payload.get("result_reasons", [])),
-                "recovery_actions": list(payload.get("recovery_actions", [])),
-            }
-            if payload.get("attestation", {}).get("status") == "created":
-                manifest["receipts"]["closeout_attestation"] = {
-                    "path": payload["attestation"]["path"],
-                    "digest": payload["attestation"]["digest"],
-                }
-            write_findings = write_event_manifest(
-                manifest,
-                args.event_manifest,
-                Path(args.workspace),
-                adapter,
-            )
-            if write_findings:
-                payload["mechanical_findings"].extend(write_findings)
-                payload["result"] = "fail"
-                payload["closeout_receipt"]["result"] = "fail"
+                if payload.get("attestation", {}).get("status") == "created":
+                    manifest["receipts"]["closeout_attestation"] = {
+                        "path": payload["attestation"]["path"],
+                        "digest": payload["attestation"]["digest"],
+                    }
+                write_findings = write_event_manifest(
+                    manifest,
+                    args.event_manifest,
+                    Path(args.workspace),
+                    adapter,
+                )
+                if write_findings:
+                    payload["mechanical_findings"].extend(write_findings)
+                    payload["result"] = "fail"
+                    payload["closeout_receipt"]["result"] = "fail"
     else:
         if not args.cases:
             raise SystemExit("closeout requires either --changed-path for live mode or a cases file for fixture mode")
@@ -7758,13 +9261,19 @@ def closeout_command(args: argparse.Namespace) -> None:
         }
     if payload.get("result") != "pass":
         payload.pop("work_map_observation", None)
-    emit(add_structured_closeout_recovery(payload))
+    return emit(add_structured_closeout_recovery(payload))
 
 
-def verify_integration_command(args: argparse.Namespace) -> None:
-    emit(verify_integration(
-        adapter_path=Path(args.adapter),
+def verify_integration_command(args: argparse.Namespace) -> int:
+    return emit(verify_integration(
+        adapter_path=args.adapter,
         source_workspace=Path(args.workspace),
+        source_repository=(
+            Path(args.source_repository)
+            if args.source_repository is not None
+            else None
+        ),
+        source_ref=args.source_ref,
         manifest_path=Path(args.event_manifest),
         attestation_path=Path(args.attestation),
         target_workspace=Path(args.target_workspace),
@@ -7773,18 +9282,17 @@ def verify_integration_command(args: argparse.Namespace) -> None:
     ))
 
 
-def preflight_event_command(args: argparse.Namespace) -> None:
+def preflight_event_command(args: argparse.Namespace) -> int:
     try:
         adapter = load_json(Path(args.adapter))
         current = load_json(Path(args.event_manifest))
     except (FileNotFoundError, SystemExit):
-        emit({
+        return emit({
             "result": "unproven",
             "conflicts": [],
             "warnings": [{"code": "current-declaration-unproven"}],
             "visibility_boundary": "Only supplied paths were inspected.",
         })
-        return
     peers = []
     for raw_path in args.peer_manifest:
         path = Path(raw_path)
@@ -7806,25 +9314,61 @@ def preflight_event_command(args: argparse.Namespace) -> None:
         attestation = pointer.get("path") if isinstance(pointer, dict) else None
         peers.append({
             "manifest": peer_manifest,
+            "manifest_path": path,
             "workspace": peer_workspace,
             "attestation": attestation,
         })
-    emit(preflight_declared_events(
+    return emit(preflight_declared_events(
         adapter=adapter,
         workspace=Path(args.workspace),
         current_manifest=current,
+        current_manifest_path=Path(args.event_manifest),
         peers=peers,
     ))
 
 
+class CliArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        self.print_usage(sys.stderr)
+        self.exit(3, f"{self.prog}: error: {message}\n")
+
+
+class RuntimeVersionAction(argparse.Action):
+    def __init__(self, option_strings, dest=argparse.SUPPRESS, default=argparse.SUPPRESS, **kwargs):
+        super().__init__(
+            option_strings=option_strings,
+            dest=dest,
+            nargs=0,
+            default=default,
+            **kwargs,
+        )
+
+    def __call__(self, parser, namespace, values, option_string=None) -> None:
+        print(runtime_identity())
+        parser.exit(0)
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = CliArgumentParser(
         description=(
             "govern-ai-coding deterministic checker with required root "
             "README.md navigation for humans and AI"
         )
     )
-    sub = parser.add_subparsers(required=True)
+    parser.add_argument(
+        "--legacy-zero-exit",
+        action="store_true",
+        help=(
+            "temporarily return status 0 for result-bearing commands without "
+            "changing their JSON result"
+        ),
+    )
+    parser.add_argument(
+        "--version",
+        action=RuntimeVersionAction,
+        help="show the installed Skill base version and package SHA-256 digest",
+    )
+    sub = parser.add_subparsers(required=True, dest="command")
 
     validate = sub.add_parser(
         "validate-adapter",
@@ -7836,6 +9380,47 @@ def build_parser() -> argparse.ArgumentParser:
         help="live workspace required to prove the schema-2 root README.md navigation entrypoint",
     )
     validate.set_defaults(func=validate_adapter_command)
+
+    validate_semantic_review_parser = sub.add_parser(
+        "validate-semantic-review",
+        help="validate Semantic Review JSON shape without event-context binding",
+    )
+    validate_semantic_review_parser.add_argument("review")
+    validate_semantic_review_parser.set_defaults(
+        func=validate_semantic_review_command,
+    )
+
+    build_validation_receipt_parser = sub.add_parser(
+        "build-validation-receipt",
+        help="build a Freeze-bound receipt from explicit validation facts without execution",
+    )
+    build_validation_receipt_parser.add_argument("adapter")
+    build_validation_receipt_parser.add_argument("--workspace", required=True)
+    build_validation_receipt_parser.add_argument("--freeze", required=True)
+    build_validation_receipt_parser.add_argument("--facts", required=True)
+    build_validation_receipt_parser.add_argument("--write-receipt", required=True)
+    build_validation_receipt_parser.set_defaults(
+        func=build_validation_receipt_command,
+    )
+
+    validate_validation_receipt_parser = sub.add_parser(
+        "validate-validation-receipt",
+        help="validate receipt structure and binding to an exact Freeze",
+    )
+    validate_validation_receipt_parser.add_argument("receipt")
+    validate_validation_receipt_parser.add_argument("--freeze", required=True)
+    validate_validation_receipt_parser.set_defaults(
+        func=validate_validation_receipt_command,
+    )
+
+    audit_event_parser = sub.add_parser(
+        "audit-event",
+        help="read only the explicit current Event Manifest v2 Closeout attempt",
+    )
+    audit_event_parser.add_argument("adapter")
+    audit_event_parser.add_argument("--workspace", required=True)
+    audit_event_parser.add_argument("--event-manifest", required=True)
+    audit_event_parser.set_defaults(func=audit_event_command)
 
     impact = sub.add_parser("impact")
     impact.add_argument("adapter")
@@ -7889,6 +9474,10 @@ def build_parser() -> argparse.ArgumentParser:
     closeout.add_argument("--write-receipt")
     closeout.add_argument("--write-attestation")
     closeout.add_argument("--event-manifest")
+    closeout.add_argument(
+        "--attempt-id",
+        help="explicit stable Closeout attempt id required by Event Manifest v2",
+    )
     closeout.add_argument("--paths-from", action="append", default=[])
     closeout.add_argument("--baseline-ref")
     closeout.add_argument("--validation-receipt", action="append", default=[])
@@ -7896,6 +9485,13 @@ def build_parser() -> argparse.ArgumentParser:
     closeout.add_argument("--final-inventory")
     closeout.add_argument("--authorized-doc", action="append", default=[])
     closeout.add_argument("--authorized-path", action="append", default=[])
+    closeout.add_argument(
+        "--authorized-paths-from",
+        action="append",
+        default=[],
+        help="load authorization-only paths with the strict --paths-from file contract",
+    )
+    closeout.add_argument("--compact", action="store_true")
     closeout.add_argument("--semantic-review")
     closeout.add_argument("--require-semantic-review", action="store_true")
     closeout.add_argument(
@@ -7917,6 +9513,8 @@ def build_parser() -> argparse.ArgumentParser:
     verify_integration_parser.add_argument("--workspace", required=True)
     verify_integration_parser.add_argument("--event-manifest", required=True)
     verify_integration_parser.add_argument("--attestation", required=True)
+    verify_integration_parser.add_argument("--source-repository")
+    verify_integration_parser.add_argument("--source-ref")
     verify_integration_parser.add_argument("--target-workspace", required=True)
     verify_integration_parser.add_argument("--target-adapter", required=True)
     verify_integration_parser.add_argument("--target-ref")
@@ -7940,6 +9538,7 @@ def build_parser() -> argparse.ArgumentParser:
     controlled_archive.add_argument("--execution-grant")
     controlled_archive.add_argument("--amendment")
     controlled_archive.add_argument("--original-execution-grant")
+    controlled_archive.add_argument("--compact", action="store_true")
     controlled_archive.set_defaults(func=controlled_archive_command)
 
     archive_task = sub.add_parser("archive-task")
@@ -7957,6 +9556,7 @@ def build_parser() -> argparse.ArgumentParser:
             action_parser.add_argument("--previous-summary")
         if action == "execute":
             action_parser.add_argument("--execution-grant", required=True)
+        action_parser.add_argument("--compact", action="store_true")
         action_parser.set_defaults(func=archive_task_command)
 
     archive_authorization_status = sub.add_parser(
@@ -7965,12 +9565,14 @@ def build_parser() -> argparse.ArgumentParser:
     archive_authorization_status.add_argument("adapter")
     archive_authorization_status.add_argument("--workspace", required=True)
     archive_authorization_status.add_argument("--authorization-id")
+    archive_authorization_status.add_argument("--compact", action="store_true")
     archive_authorization_status.set_defaults(
         func=archive_authorization_status_command
     )
 
     normalize_archive = sub.add_parser("normalize-archive-result")
     normalize_archive.add_argument("--input", required=True)
+    normalize_archive.add_argument("--compact", action="store_true")
     normalize_archive.set_defaults(func=normalize_archive_result_command)
 
     diagnose_parser = sub.add_parser(
@@ -8032,10 +9634,40 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def emit_internal_error() -> int:
+    emit({
+        "result": "fail",
+        "mechanical_findings": [{
+            "code": "internal-error",
+            "severity": "blocking",
+            "category": "runtime",
+            "message": "The command stopped at an unexpected internal failure.",
+            "recovery_actions": [
+                "Preserve the inputs and rerun with a repaired or known-good GAC package."
+            ],
+        }],
+        "semantic_findings": [],
+        "human_approval_required": [],
+        "recovery": (
+            "Preserve the inputs and rerun with a repaired or known-good GAC package."
+        ),
+    })
+    return 3
+
+
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
-    args.func(args)
-    return 0
+    try:
+        args = build_parser().parse_args(argv)
+    except Exception:
+        return emit_internal_error()
+    compact_token = _COMPACT_OUTPUT.set(bool(getattr(args, "compact", False)))
+    try:
+        status = args.func(args)
+    except Exception:
+        return emit_internal_error()
+    finally:
+        _COMPACT_OUTPUT.reset(compact_token)
+    return 0 if args.legacy_zero_exit else status
 
 
 if __name__ == "__main__":

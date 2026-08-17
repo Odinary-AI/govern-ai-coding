@@ -9,6 +9,7 @@ import re
 try:
     from closeout_evidence import (
         bind_closeout_attestation,
+        current_closeout_attempt,
         parse_closeout_attestation,
     )
 except ModuleNotFoundError:
@@ -21,6 +22,7 @@ except ModuleNotFoundError:
     _evidence_module = importlib.util.module_from_spec(_evidence_spec)
     _evidence_spec.loader.exec_module(_evidence_module)
     bind_closeout_attestation = _evidence_module.bind_closeout_attestation
+    current_closeout_attempt = _evidence_module.current_closeout_attempt
     parse_closeout_attestation = _evidence_module.parse_closeout_attestation
 
 try:
@@ -106,14 +108,18 @@ def _safe_path(value: object) -> bool:
 
 
 def _declared_manifest(
-    value: object, declared_workspace: Path,
+    value: object,
+    declared_workspace: Path,
+    manifest_path: Path | None = None,
 ) -> tuple[dict | None, set[str]]:
     if not isinstance(value, dict):
         return None, set()
     if (
-        value.get("schema") != "govern-ai-coding.event-manifest.v1"
-        or value.get("schema_version") != "1"
-    ):
+        value.get("schema"), value.get("schema_version")
+    ) not in {
+        ("govern-ai-coding.event-manifest.v1", "1"),
+        ("govern-ai-coding.event-manifest.v2", "2"),
+    }:
         return None, set()
     event = value.get("event")
     scope = value.get("scope")
@@ -124,7 +130,13 @@ def _declared_manifest(
     raw_workspace = event.get("workspace")
     if not isinstance(raw_workspace, str) or not raw_workspace:
         return None, set()
-    if Path(raw_workspace).resolve() != Path(declared_workspace).resolve():
+    recorded_workspace = Path(raw_workspace)
+    if not recorded_workspace.is_absolute():
+        if value.get("schema") == "govern-ai-coding.event-manifest.v2":
+            if manifest_path is None:
+                return None, set()
+            recorded_workspace = manifest_path.parent / recorded_workspace
+    if recorded_workspace.resolve() != Path(declared_workspace).resolve():
         return None, set()
     paths: list[str] = []
     for key in MUTATION_SCOPE_KEYS:
@@ -311,8 +323,21 @@ def _bound_peer_payload(adapter: dict, descriptor: dict) -> tuple[dict | None, s
     workspace = Path(descriptor["workspace"])
     attestation = descriptor.get("attestation")
     if attestation is None:
-        pointer = (manifest.get("receipts") or {}).get("closeout_attestation")
-        attestation = pointer.get("path") if isinstance(pointer, dict) else None
+        if manifest.get("schema") == "govern-ai-coding.event-manifest.v2":
+            current = current_closeout_attempt(
+                manifest,
+                manifest_path=(
+                    Path(descriptor["manifest_path"])
+                    if descriptor.get("manifest_path") is not None
+                    else None
+                ),
+                workspace=workspace,
+                adapter=adapter,
+            )
+            attestation = current.get("attestation_path")
+        else:
+            pointer = (manifest.get("receipts") or {}).get("closeout_attestation")
+            attestation = pointer.get("path") if isinstance(pointer, dict) else None
     if not isinstance(attestation, (str, Path)):
         return None, "missing"
     config = adapter.get("work_map")
@@ -330,6 +355,11 @@ def _bound_peer_payload(adapter: dict, descriptor: dict) -> tuple[dict | None, s
         adapter=adapter,
         workspace=workspace,
         manifest=manifest,
+        manifest_path=(
+            Path(descriptor["manifest_path"])
+            if descriptor.get("manifest_path") is not None
+            else None
+        ),
     )
     if bound.get("status") != "matching":
         return None, str(bound.get("status", "evidence-incomplete"))
@@ -342,11 +372,16 @@ def preflight_declared_events(
     workspace: Path,
     current_manifest: dict,
     peers: list[dict],
+    current_manifest_path: Path | None = None,
 ) -> dict:
     """Compare only declared event facts and explicitly supplied evidence."""
     conflicts: list[dict] = []
     warnings: list[dict] = []
-    current, current_paths = _declared_manifest(current_manifest, Path(workspace))
+    current, current_paths = _declared_manifest(
+        current_manifest,
+        Path(workspace),
+        current_manifest_path,
+    )
     if current is None:
         warnings.append({"code": "current-declaration-unproven"})
         valid_peers: list[tuple[dict, set[str], dict]] = []
@@ -362,7 +397,13 @@ def preflight_declared_events(
                 warnings.append({"code": "peer-declaration-unproven", "peer": index})
                 continue
             declared, declared_paths = _declared_manifest(
-                peer_value, Path(peer_workspace),
+                peer_value,
+                Path(peer_workspace),
+                (
+                    Path(descriptor["manifest_path"])
+                    if descriptor.get("manifest_path") is not None
+                    else None
+                ),
             )
             if declared is None:
                 warnings.append({"code": "peer-declaration-unproven", "peer": index})
@@ -423,10 +464,26 @@ def preflight_declared_events(
             adapter, Path(workspace), current, current_paths,
         )
         for peer_manifest, _, descriptor in valid_peers:
-            has_attestation = descriptor.get("attestation") is not None or isinstance(
-                (peer_manifest.get("receipts") or {}).get("closeout_attestation"),
-                dict,
-            )
+            if peer_manifest.get("schema") == "govern-ai-coding.event-manifest.v2":
+                peer_current = current_closeout_attempt(
+                    peer_manifest,
+                    manifest_path=(
+                        Path(descriptor["manifest_path"])
+                        if descriptor.get("manifest_path") is not None
+                        else None
+                    ),
+                    workspace=Path(descriptor["workspace"]),
+                    adapter=adapter,
+                )
+                has_attestation = (
+                    peer_current.get("status") == "matching"
+                    and isinstance(peer_current.get("attestation_binding"), dict)
+                )
+            else:
+                has_attestation = descriptor.get("attestation") is not None or isinstance(
+                    (peer_manifest.get("receipts") or {}).get("closeout_attestation"),
+                    dict,
+                )
             if not has_attestation:
                 continue
             if baseline is None:

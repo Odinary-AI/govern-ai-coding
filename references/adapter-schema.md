@@ -92,12 +92,100 @@ Closeout also returns additive schema-1 fields:
 `fail` is reserved for deterministic defects. Semantic uncertainty or missing
 human approval is `unproven`.
 
+Closeout and archive commands may project their completed producer payloads as
+`govern-ai-coding.compact-result.v1` when `--compact` is explicit. The
+projection retains result/verdict, phase, recovery, approvals, receipt
+bindings, and every structured diagnostic occurrence. It groups occurrences
+by existing severity, category, code, and recovery actions and lists omitted
+top-level producer fields. The projection does not change producer payload
+construction, receipt or summary files, filesystem state, or process status.
+Full output remains the default and there is no global finding registry.
+
+## Canonical Evidence Digest Profiles
+
+Canonical JSON digests are protocol fields, not the formatting of JSON files or
+CLI output. Existing v1 contracts use two profiles and must not be normalized
+into one:
+
+- **Evidence v1 / ASCII-escaped:** `json.dumps(value, sort_keys=True,
+  separators=(",", ":"))`, UTF-8 encoding of that text, then SHA-256. Python's
+  default `ensure_ascii=True` is part of this profile.
+- **Controlled Archive v1 / literal UTF-8:** the same operation with
+  `ensure_ascii=False` before UTF-8 encoding and SHA-256.
+
+Both profiles sort keys recursively, omit insignificant whitespace, and encode
+JSON `null`, `true`, and `false` in the normal JSON form. They produce identical
+digests for ASCII-only values and different digests when a string or key
+contains non-ASCII characters. Neither profile performs Unicode normalization.
+Consumers must call the profile owned by their protocol; equal output for an
+ASCII fixture does not prove that two protocols are interchangeable.
+
+### Schema Producer And Consumer Inventory
+
+| Schema or object | Producer | Digest consumer or binding | Profile |
+| --- | --- | --- | --- |
+| adapter schema 2 | project owner; validated by the core CLI | Impact `adapter_binding`, Closeout Attestation `adapter.digest`, integration verification | Evidence v1 |
+| `govern-ai-coding.inventory.v1` | core Git/filesystem inventory | Impact and Closeout; no standalone inventory identity, but bytes become part of a digested Impact receipt | Evidence v1 when the containing receipt is bound |
+| `govern-ai-coding.receipt.v1` | core Impact | scope extension, Event Manifest, Closeout, declared-event preflight, Closeout Attestation | Evidence v1 |
+| `govern-ai-coding.freeze-receipt.v1` | core Freeze | Validation Receipt, Closeout, Closeout Attestation | Evidence v1 |
+| `govern-ai-coding.event-manifest.v1` | core Impact/Freeze/Closeout updates | core phase reuse, declared-event preflight, Work Map status, integration verification | No standalone canonical digest field in v1; deterministic file serialization is not an identity profile |
+| `govern-ai-coding.event-manifest.v2` | core Impact/Freeze/Closeout updates | core phase reuse; explicit current-attempt reading by declared-event preflight, Work Map status, and integration verification | No standalone manifest digest; attempts bind their receipts and optional attestations with Evidence v1 |
+| `govern-ai-coding.semantic-review.v1` | reviewing task | core validation, Closeout, Closeout Attestation | Evidence v1 |
+| `govern-ai-coding.validation-facts.v1` | project validation workflow | Validation Receipt builder | No standalone canonical digest; selected fields are copied into the receipt |
+| `govern-ai-coding.validation-receipt.v1` | Closeout evidence owner | Closeout, attestation binding, integration verification | Evidence v1 |
+| `govern-ai-coding.closeout-receipt.v1` | core Closeout | caller, v1 result projection, and v2 attempt binding | Evidence v1 when bound by a v2 attempt; no standalone digest field in v1 |
+| `govern-ai-coding.closeout-attestation.v1` | Closeout evidence owner | declared-event preflight and integration verification | Evidence v1 |
+| `govern-ai-coding.compact-result.v1` | core presentation boundary | opt-in CLI caller | No standalone canonical digest field |
+| `govern-ai-coding.archive-request.v1` | archive request author | archive preflight, execution grant, task preflight and reconciliation | Controlled Archive v1, except the retained Archive Receipt v1 field below |
+| `govern-ai-coding.archive-preflight.v1` | Controlled Archive owner | execution-grant validation | Controlled Archive v1 for `preflight_sha256` |
+| `govern-ai-coding.archive-execution-grant.v1` | explicitly authorized archive workflow | core archive execution and receipt authorization | Controlled Archive v1 |
+| `govern-ai-coding.archive-receipt.v1` | core archive executor | task resume/status/reconciliation and Task Summary | Mixed retained v1 contract: whole-receipt and grant bindings use Controlled Archive v1; `request_sha256` produced by the core executor uses the legacy ASCII-escaped profile |
+| `govern-ai-coding.archive-task.v1` | archive task author | global/task preflight, task grant, reconciliation | Controlled Archive v1 |
+| `govern-ai-coding.archive-task-preflight.v1` | Controlled Archive/core task preflight | task execution grant and task execution | Controlled Archive v1 |
+| `govern-ai-coding.archive-task-execution-grant.v1` | explicitly authorized archive workflow | core task execution and per-operation grant refresh | Controlled Archive v1 |
+| `govern-ai-coding.archive-task-summary.v1` | historical Controlled Archive task reconciliation | current normalizer and resume/status readers | Controlled Archive v1 for embedded manifest/receipt bindings; any previous-summary file link is raw file SHA-256 |
+| `govern-ai-coding.archive-task-summary.v2` | current Controlled Archive task reconciliation | current normalizer and resume/status readers | Controlled Archive v1 for manifest, receipt-object, and execution-result bindings; any previous-summary file link is raw file SHA-256 |
+| `govern-ai-coding.archive-mapping-amendment.v1` | explicitly authorized archive workflow | archive preflight, grant refresh, receipt authorization | Controlled Archive v1 |
+| `govern-ai-coding.normalized-result.v1` | Controlled Archive result normalizer | core/archive presentation and recovery callers | No standalone canonical digest field |
+| Work Map typed item | Work Map parser | Closeout observation and Work Map status | Evidence-v1 byte profile, owned separately as the Work Map item-v1 digest |
+| Work Map source table | Work Map parser | Impact baseline, Closeout observation, status | Raw selected table bytes, not canonical JSON |
+| Skill package identity | core `--version` | runtime mismatch diagnosis | Ordered relative paths and raw file bytes, not canonical JSON |
+| governed file content | inventory, Freeze, archive and integration observers | isolation, final-content and archive-content checks | Raw file bytes, not canonical JSON |
+| `govern-project-docs.closeout-attestation.v1` | historical predecessor | integration verifier's compatibility reader | Read-only historical envelope; missing modern evidence-v1 identity limits conclusions to `unproven` |
+| `govern-ai-coding.publication-verification.v1` | external release workflow | human/release audit only | No runtime producer, consumer, or canonical JSON identity in this Skill |
+
+The Archive Receipt v1 exception is intentionally explicit. For a non-ASCII
+archive request, its retained ASCII-escaped `request_sha256` does not equal the
+literal-UTF-8 request digest expected by current archive reconciliation. Batch A
+does not rewrite that v1 field. A compatible repair requires a new schema or an
+explicit migration contract rather than silently changing an existing digest.
+
+`canonical_evidence_v1_digest` in `closeout_evidence.py` owns the shared
+evidence contract used by the core CLI and integration verifier.
+`canonical_archive_v1_digest` in `controlled_archive.py` owns the archive
+contract. `legacy_archive_receipt_v1_request_digest` exists only for the
+retained Archive Receipt v1 producer behavior. The main CLI also retains
+`archive_protocol_digest` as a module-level compatibility alias for existing
+callers; new archive code uses the versioned owner name.
+
+These profiles describe the current Python implementation and constrained
+payloads. They do not claim cross-language portability for unconstrained
+numbers, Unicode normalization equivalence, or compatibility for a producer
+that changes JSON type semantics.
+
 ## Controlled Archive Contract
 
 The complete request, grant, preflight, task, amendment, receipt, lifecycle,
 result-normalization, and migration contracts are in
 [Controlled Archive Protocol](controlled-archive.md). Adapter schema is `"2"`;
 the controlled-archive additions below remain optional.
+
+New archive task summaries use
+`govern-ai-coding.archive-task-summary.v2`. Verified successful operations
+retain receipt path/digest and execution-result digest references rather than
+duplicating the complete success envelope. Failed, unknown, or unbound results
+remain complete, individual receipts remain self-contained, and v1 summaries
+remain readable.
 
 ```json
 {
@@ -199,6 +287,16 @@ state is `unproven`; only a proven identity or binding contradiction fails.
 An older attestation without the observation remains readable, but is
 `unproven` for current governance closure. Events without
 `work_map_binding` retain the schema-1 legacy validation pointer behavior.
+
+The standalone builder accepts
+`govern-ai-coding.validation-facts.v1`: exact `pass` result, non-empty unique
+`input_classes`, non-empty commands whose results are exactly `pass`, a
+non-empty environment object, and non-empty supported and unsupported claim
+lists. It copies those fields and binds the canonical Freeze digest plus every
+frozen path digest into the existing V1 receipt. It does not execute commands,
+parse their output, or infer claims. Builder output is create-only and must be
+adapter-excluded or outside project authority. See
+`validation-facts-example.json` for the packaged input shape.
 
 Missing adapter files return `unproven` with `adapter-missing` rather than a
 traceback. Create a candidate adapter from project pointers and ask for human
@@ -317,6 +415,56 @@ identifies each invalid command index, the expected value, and the received
 value so only the receipt needs correction when its underlying evidence
 remains valid.
 
+### Validation Receipt Consumer Profiles
+
+`VALIDATION_CONSUMER_PROFILES` in `closeout_evidence.py` is the centralized
+versioned registry for current consumers. Every new internal validation or
+collection call must name a profile; the old boolean Python entrypoints remain
+deprecated compatibility wrappers and are not used by production callers.
+Each registered profile mechanically declares its consumers and purpose,
+requirements on four independent axes, compatible omissions, supported and
+unsupported conclusions, and reopen and sunset conditions. Machine-readable
+`mode` and `required_when` values are checked against the implemented policy
+set on every profile evaluation; unknown profiles or drift between registry
+and implementation fail before receipt evaluation.
+
+The axes are orthogonal and each reports `pass`, `fail`, or `unproven`:
+
+- **structure** checks the receipt schema and required field shapes plus any
+  supplied Freeze schema/kind required by the selected profile;
+- **binding** checks the receipt's exact Evidence-v1 Freeze digest relation;
+- **content** checks valid path/digest entries and the receipt projection
+  against the supplied Freeze;
+- **freshness** checks the relevant frozen bytes against the current workspace.
+
+They are not a linear evidence state machine. An optional or compatibility
+axis may remain `unproven` while the profile accepts the receipt. Acceptance
+means the receipt is mechanically usable by that consumer; only the profile's
+explicit supported conclusions may be carried forward. Acceptance never means
+that commands were executed or that a batch, product, release, or deployment
+is ready.
+
+| Profile | Current consumers | Required checks | Compatible omissions | Supported boundary |
+| --- | --- | --- | --- | --- |
+| `standalone-freeze-bound-v1` | `validate-validation-receipt` | current structure; exact complete-Freeze digest and path projection | `input_classes` may be absent | structure and exact supplied-Freeze binding only; freshness is `unproven` |
+| `closeout-compatible-v1` | ordinary Closeout; Closeout Attestation source rebinding; Integration Verification trust preflight | current-V1 structure; freshness only when a complete modern input projection exists | legacy string-schema receipts remain identity-only; current receipts may omit `input_classes`; receipt-to-Freeze binding is not required | receipt identity, plus current listed bytes for a complete modern projection; identity-only acceptance supports no validation claim |
+| `work-map-closeout-v1` | Closeout only when the Event Manifest has `work_map_binding` | current structure; exact supplied-Freeze digest and projection; every supplied frozen path is current | supplied Freeze kind may be omitted on the retained partial-Freeze path; `input_classes` may be absent | exact supplied-Freeze relation and current supplied paths; enclosing Closeout must separately prove that Freeze is the event's complete valid Freeze |
+
+The ordinary profile is selected even when an Event Manifest is present; the
+Work Map binding, not manifest presence, selects `work-map-closeout-v1`.
+`work-map-closeout-v1` pass implies the same modern receipt is accepted by
+`closeout-compatible-v1`. No general implication exists from standalone pass
+to compatible pass because the standalone consumer deliberately does not read
+workspace bytes.
+
+Removing required receipt evidence, changing its Freeze binding or projection,
+or making checked workspace content stale cannot strengthen a profile result.
+An `unproven` axis is never promoted to `pass` merely because the profile
+permits that omission. Reopen a profile conclusion whenever the inputs named
+by its registry entry change. Retire a V1 profile only through the entry's
+sunset condition and an explicit receipt migration contract; do not silently
+reinterpret historical V1 receipts.
+
 | Change or result | Validation action |
 | --- | --- |
 | Ordinary governance document not consumed by runtime regression | Rerun affected document, link, or architecture checks only. |
@@ -347,6 +495,35 @@ decision → request that decision.
 README navigation coverage is separate from current-authority link coverage.
 It does not crawl the whole repository, fetch external URLs, validate heading
 anchors, judge README correctness, or assign README semantic authority.
+
+## Read-only Event Audit
+
+`audit-event <adapter> --workspace <path> --event-manifest <manifest>` accepts
+Event Manifest v2 only. It validates the adapter and manifest, then selects
+the current Closeout evidence exclusively through the manifest's explicit
+`closeout.current` pointer and `current_closeout_attempt()`. It never scans an
+evidence directory, infers a conventional filename, compares timestamps, or
+falls back from a stale pointer to a nearby file.
+
+The command revalidates the current attempt's receipt path, schema, canonical
+Evidence-v1 digest, result and Freeze binding; the receipt's complete Impact
+and Freeze snapshots; adapter, workspace and baseline identity; current frozen
+workspace bytes; and, when present, the attestation path, schema, digest and
+complete source-context binding. Relative evidence paths retain the v2
+manifest-directory rules. Missing, unsafe, symlinked, hardlinked,
+wrong-schema, wrong-digest, stale-content or identity-mismatched evidence fails
+closed. An empty valid ledger is `unproven`; a malformed or contradictory
+ledger is `fail`.
+
+Output schema `govern-ai-coding.audit-event-result.v1` separates checks,
+mechanical findings, supported claims, unsupported claims and recovery. A
+valid current receipt can pass without an optional attestation while portable
+attestation claims remain explicitly unsupported. Event Manifest v1 returns
+`unproven` with `audit-event-v1-unsupported`; it is never guessed, rewritten or
+silently upgraded. The command is strictly read-only, does not require
+`fcntl`, writes no receipt or manifest, and never installs a package. Its pass
+does not prove actor identity, semantic truth, human approval, release,
+deployment, product acceptance or readiness.
 
 ## Live Closeout
 
@@ -548,9 +725,11 @@ scope, target paths, and explicit non-approved approval/path boundaries.
 
 ## Optional Event Manifest
 
-The event manifest schema is `govern-ai-coding.event-manifest.v1`, version
-`"1"`. It is generated event evidence and must not become project authority.
-The minimum object is:
+Event Manifest v1 (`govern-ai-coding.event-manifest.v1`, version `"1"`) and v2
+(`govern-ai-coding.event-manifest.v2`, version `"2"`) are generated event
+evidence and must not become project authority. Existing v1 objects are read
+and updated with their existing semantics; they are never automatically
+rewritten or upgraded. The v1 minimum object remains:
 
 ```json
 {
@@ -613,6 +792,111 @@ workspace, identity, or baseline inputs fail. Manifest writes are deterministic
 and atomic and are allowed only outside the workspace or under an adapter
 excluded boundary.
 
+### Event Manifest v2 Closeout ledger
+
+V2 retains the v1 `event`, `scope`, `approvals`, `semantic_review`, optional
+`work_map_binding`, and `receipts.impact`, `.freeze`, and `.validation` fields.
+It removes `receipts.closeout_attestation` and replaces the overwriteable v1
+Closeout result slot with one append-only ledger:
+
+```json
+{
+  "schema": "govern-ai-coding.event-manifest.v2",
+  "schema_version": "2",
+  "closeout": {
+    "attempts": [
+      {
+        "id": "batch-c-closeout-01",
+        "result": "pass",
+        "result_reasons": ["all-closeout-gates-satisfied"],
+        "recovery_actions": ["preserve immutable evidence"],
+        "receipt": {
+          "path": "attempts/batch-c-closeout-01.json",
+          "schema": "govern-ai-coding.closeout-receipt.v1",
+          "digest": "64 lowercase hexadecimal characters"
+        },
+        "freeze_digest": "64 lowercase hexadecimal characters",
+        "attestation": null
+      }
+    ],
+    "current": "batch-c-closeout-01"
+  }
+}
+```
+
+`attempts` is the only v2 Closeout ledger. V2 rejects parallel
+`closeout.result`, `result_reasons`, or `recovery_actions` projections and the
+v1 attestation slot. Each attempt ID matches
+`[A-Za-z0-9][A-Za-z0-9._-]{0,127}` and is supplied explicitly with
+`closeout --attempt-id`; it is an audit identity, not a timestamp or inferred
+ordering key. V2 also requires `--write-receipt`. Recorded duplicate IDs,
+receipt paths, or attestation paths fail. An unrecorded existing destination is
+reusable only when rereading proves the complete JSON object and canonical
+Evidence-v1 digest are identical; no evidence file is overwritten. A
+post-link interruption alias is cleaned only after its controlled temp name,
+same-directory inode identity, canonical payload, and complete link count all
+match; any unrecognized alias fails closed.
+
+Every attempt binds a real `govern-ai-coding.closeout-receipt.v1` file, its
+schema and canonical Evidence-v1 digest, the exact final `pass`, `fail`, or
+`unproven` result, and the receipt's additive canonical Impact and Freeze
+snapshots. The complete Freeze snapshot's digest, kind, adapter, workspace,
+paths, derived markers, and Closeout final-content projection are checked. Optional
+attestations must be pass attestations with matching schema and digest and may
+appear only on pass attempts. Relative evidence paths resolve from the event
+manifest directory. Absolute paths must be canonical. Parent escapes, symlink
+or hardlink alias traversal, repeated or dot path aliases, missing or
+non-regular files, and in-workspace evidence
+outside adapter-excluded boundaries fail.
+
+`current` is either JSON `null` when no valid pass exists or the ID of the last
+mechanically valid pass appended to `attempts`. A pass receipt must already be
+persisted and reread before its attempt can be appended. A requested
+attestation must likewise be persisted and reread first. The candidate attempt
+and `current` advance in one locked compare-and-swap against the exact loaded
+manifest; Impact and Freeze use the same stale-writer guard. A fail or unproven
+attempt appends without clearing or downgrading an earlier valid current.
+Receipt, attestation, or manifest publication failure creates no attempt; any
+already persisted, unreferenced, canonically equivalent evidence can be strictly
+rebound by the retry.
+
+The CLI does not require `fcntl` merely to import or run v1 and read-only v2
+paths. V1 manifest updates keep their existing atomic-file semantics when that
+module is absent. A v2 manifest write, including Impact, Freeze, or Closeout,
+requires the inter-process lock that protects its compare-and-swap. Without
+that capability it returns structured `fail` with
+`event-manifest-lock-unavailable`, leaves the manifest unchanged, and never
+uses an unlocked fallback. A v2 write also requires the exact raw canonical
+digest of the loaded snapshot; omitting it returns
+`event-manifest-cas-required` instead of performing a non-CAS replacement. If
+an existing destination is unreadable, a legacy candidate also fails closed
+because the writer cannot prove that the destination is non-v2.
+
+Validators check attempt uniqueness, current referential integrity, result,
+schema, canonical digest, Freeze binding, optional attestation binding, and
+path safety for every attempt. `current_closeout_attempt()` is the mechanical
+read-only API for later consumers: it returns only the explicitly pointed
+attempt and its rebound Closeout receipt/attestation bindings. It never scans a
+directory, chooses the greatest timestamp, or guesses a filename. Work Map
+status, declared-event preflight, and Integration Verification retain their v1
+pointer behavior and use this helper for v2. V2 attestation rebinding uses the
+current receipt's immutable Impact/Freeze snapshots and the attestation's own
+Semantic Review and validation bindings, not mutable top-level review or
+receipt slots. Integration Verification resolves this context through
+`current_closeout_attempt()`; top-level v2 actual scope cannot override the
+current receipt's final-content paths. V1 keeps its existing top-level pointer
+contract.
+
+| Consumer or update | Event Manifest v1 | Event Manifest v2 |
+| --- | --- | --- |
+| Impact | Updates normalized planned scope and embedded Impact receipt | Same fields; schema remains v2 |
+| Freeze | Updates actual scope, Freeze, and validation pointers | Same fields; preserves attempts/current |
+| Closeout | Replaces `closeout.result` details and may set `receipts.closeout_attestation` | Appends one unique attempt; valid pass atomically advances `current` |
+| Attestation binding | Reads `receipts.closeout_attestation` | Reads only current attempt's attestation binding |
+| Work Map status | Existing v1 pointer behavior | Reads only validated `current` |
+| Declared-event preflight | Existing declarations and v1 peer pointer | Same declarations; peer proof only through validated `current` |
+| Integration Verification | Rebinds supplied attestation to v1 pointer | Supplied attestation must equal validated current binding |
+
 ## Path Authorization And Diagnostics
 
 Use `--authorized-path` for the event's writable paths. The former
@@ -620,6 +904,12 @@ Use `--authorized-path` for the event's writable paths. The former
 `authorized-doc-deprecated`. Both feed the compatibility
 `closeout.authorized_docs` field; `closeout.authorized_paths` is the precise
 additive name.
+
+Repeatable `--authorized-paths-from` reuses the strict `--paths-from` file
+formats and path normalization, but its values are unioned only into
+authorization. They never add changed or actual event scope. Missing,
+malformed, or unsafe inputs fail before a Closeout receipt or attestation is
+written.
 
 Path authorization does not approve document claims. Human and protected
 approval bindings remain separate and are checked exactly as before.
@@ -690,15 +980,35 @@ additive identity or input evidence limits dependent conclusions to
 
 ## Post-Integration Verification
 
-`verify-integration` requires the source adapter, source workspace, source
+`verify-integration` requires a source adapter, recorded event workspace,
 event manifest, immutable attestation, target workspace, and target adapter
-path. An optional Git ref reads target blobs without checkout. The result
-separates attestation binding, target adapter identity, per-path content,
-ancestry or unresolved-index evidence, and per-claim validation inheritance.
-Only explicitly declared input classes with direct target evidence can pass;
-unknown or unavailable classes remain `unproven`. Changes outside attested
-paths do not invalidate content evidence. The command is read-only and does
-not prove branch, release, deployment, or product readiness.
+path. `--source-repository` and `--source-ref` are paired: neither retains the
+exact legacy filesystem behavior, while one alone is a structured failure. In
+explicit mode the positional source adapter and target adapter are strict
+repository-relative paths, and refs are only full OIDs or valid full
+`refs/...` names. Revision expressions and discovery scans are not inputs.
+
+The derived source commit must have one sole parent equal to the manifest
+baseline; source merge commits are unsupported. Its no-rename diff paths must
+equal `actual_paths` exactly, and its regular blobs must match final-content
+existence and bytes plus adapter identity. An existing `final_git_commit` is
+accepted only when it equals the derived commit. The recorded
+`event.workspace` remains identity and may be absent. One Git-tree content
+observer rebinds final content and modern Validation Receipt freshness from
+source objects. Explicit v1/v2 mode safely preflights external bound evidence,
+which is required after workspace deletion when workspace-relative evidence is
+not observable; legacy callers retain their filesystem behavior.
+
+The result separates source identity, attestation binding, target adapter
+identity, per-path content, ancestry, and per-claim validation inheritance. A
+target ref passes history only when it is the derived source commit or a
+descendant. A direct non-descendant is `fail`; unavailable objects and
+shallow/graft boundaries are `unproven`. `git-history` and other claims inherit
+only after all directly observable required relations pass. Git replacement,
+graft, and inherited Git repository/worktree/object/index/namespace/shallow
+environment redirection cannot alter observation. The command is read-only
+derived evidence, not approval, status, branch, release, deployment, or
+product-readiness authority.
 
 ## Declared Event Preflight
 
@@ -719,9 +1029,11 @@ create that conflict. The command has no visibility beyond supplied
 declarations and evidence; it does not enumerate or control sessions, tasks,
 processes, branches, or worktrees and is not a scheduler or lock manager.
 
-When an event manifest is used, `receipts.closeout_attestation` is recorded
-only after successful creation. The acceptance report should already name that future
-path before Freeze; it does not need a post-Closeout content edit.
+With Event Manifest v1, `receipts.closeout_attestation` is recorded only after
+successful creation. With v2, the binding is recorded only in the new pass
+attempt and is selected only through `closeout.current`. The acceptance report
+should already name that future path before Freeze; it does not need a
+post-Closeout content edit.
 
 ### Semantic Review Binding
 
@@ -737,8 +1049,17 @@ scripts/govern_ai_coding.py closeout adapter.json \
   --semantic-review review.json
 ```
 
-The review is JSON in V1. It must include:
+The review is JSON in V1. Run standalone shape preflight when useful:
 
+```bash
+scripts/govern_ai_coding.py validate-semantic-review review.json
+```
+
+The standalone command checks shape only. The packaged
+`semantic-review-example.json` is the canonical complete example consumed by
+documentation and tests. A valid review must include:
+
+- exact schema `govern-ai-coding.semantic-review.v1`;
 - four answers: `important_claims_changed`, `affected_questions`,
   `documents_agree_with_evidence`, and `remaining_uncertainty`;
 - `findings`;
@@ -746,9 +1067,16 @@ The review is JSON in V1. It must include:
 - resolved findings require `resolution` and `resolution_evidence`.
 
 The four answers contain non-empty strings or non-empty string lists. Each
-finding field except `human_boundary` is a non-empty string;
-`human_boundary` is a JSON boolean. It is not automatically mapped to an
-adapter approval type.
+finding core field except `human_boundary` is a non-empty string;
+`human_boundary` is a JSON boolean. `status` is exactly `resolved` or
+`unresolved`. Resolved findings require non-empty string `resolution` and
+`resolution_evidence`; unresolved findings may omit them, but supplied values
+must still be non-empty strings. `human_boundary` is not automatically mapped
+to an adapter approval type.
+
+Standalone preflight does not check event paths or authorization and does not
+turn unresolved findings into a Closeout pass. Closeout reuses the same shape
+validator and then applies contextual resolution-evidence binding.
 
 Closeout behavior:
 

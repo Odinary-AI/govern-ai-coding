@@ -21,6 +21,18 @@ and approval types.
 - Unclassified, conflicting, unreadable, unsupported, or ambiguous state is
   fail-closed.
 
+## Result Presentation
+
+Controlled archive, archive task, authorization-status, and result-normalizer
+commands accept opt-in `--compact`. Full producer JSON remains the default.
+Compact mode is a presentation-only
+`govern-ai-coding.compact-result.v1` projection: it retains result/verdict,
+phase, recovery, approval and receipt-binding fields when present, and groups
+every structured diagnostic occurrence by existing severity, category, code,
+and recovery actions. It does not change preflight, execution, receipts, task
+summaries, filesystem effects, authorization state, or process status. Omit
+the flag whenever a consumer needs an omitted producer-specific field.
+
 ## Trigger Boundary
 
 Requests to inspect stale, duplicate, superseded, unconsumed, or historical
@@ -380,8 +392,10 @@ python3 <executor> archive-task status <adapter> \
   --manifest <task-manifest>
 ```
 
-Task summary schema:
-`govern-ai-coding.archive-task-summary.v1`.
+New task summary schema:
+`govern-ai-coding.archive-task-summary.v2` with `schema_version: "2"`.
+Existing `govern-ai-coding.archive-task-summary.v1` summaries remain readable
+and normalizable.
 
 States include not started, preflight passed, awaiting authorization,
 completed with verified receipt, execution failed, execution outcome unknown,
@@ -391,6 +405,32 @@ publication is exclusive; a later generation uses another path and passes its
 predecessor during preflight rather than overwriting it. Each summary binds the
 manifest, global preflight, task grant, operation request digests, and verified
 individual receipt digests.
+
+Task Summary v2 compacts only a successful entry whose individual receipt has
+been reloaded and bound by path and SHA-256. Its execution entry contains:
+
+```json
+{
+  "id": "<operation-id>",
+  "state": "completed-receipt-verified",
+  "skipped": false,
+  "receipt": {
+    "path": "<individual-receipt-path>",
+    "sha256": "<individual-receipt-file-digest>"
+  },
+  "execution_result_sha256": "<canonical-digest-of-omitted-result>"
+}
+```
+
+The digest keeps the compact entry bound to the omitted success envelope; the
+immutable individual receipt remains the self-contained evidence source. An
+entry is not compacted when its receipt binding is absent or invalid. Failed
+and `execution-outcome-unknown` entries retain the complete original result,
+including diagnostics, filesystem state-change facts, and recovery actions.
+Compaction does not change execution, resume, grant, recovery, normalization,
+or individual receipt behavior. A 22-operation real-execution regression
+fixture enforces that the serialized v2 summary is no more than 50 percent of
+the equivalent v1 full-envelope projection.
 
 ## Immutable Mapping Amendment
 

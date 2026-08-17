@@ -55,6 +55,73 @@ creating, repairing, or validating an adapter or a protocol payload. Use
 `scripts/govern_ai_coding.py` for deterministic checks; use command `--help`
 instead of loading flag documentation into the normal workflow.
 
+The CLI preserves producer-owned JSON envelopes and returns process status 0
+for `pass`, 1 for `fail`, 2 for `unproven`, and 3 for usage or unexpected
+internal failure. `--legacy-zero-exit` is a temporary caller-migration option
+that never changes JSON meaning. Use `--version` to identify the installed
+base version and Git-independent Skill package digest before diagnosing a
+suspected runtime mismatch.
+
+Use `validate-semantic-review REVIEW.json` to catch schema, answer, finding,
+status, boolean, and resolution-field shape defects before Closeout. This is a
+shape-only preflight: only Closeout can bind the review and its resolution
+evidence to the governed event.
+
+Use `build-validation-receipt ADAPTER --workspace WORKSPACE --freeze FREEZE
+--facts FACTS --write-receipt OUTPUT` to construct a create-only receipt from
+explicit validation facts, then use `validate-validation-receipt RECEIPT
+--freeze FREEZE` to check its structure and exact Freeze binding. These
+commands do not select or run validation, parse framework output, or infer
+approval, release, or readiness claims. The packaged facts example is
+`references/validation-facts-example.json`.
+
+Validation Receipt consumers select one explicit versioned profile:
+`standalone-freeze-bound-v1` for the standalone validator,
+`closeout-compatible-v1` for ordinary Closeout and attestation rebinding, or
+`work-map-closeout-v1` for a Closeout Event Manifest carrying a Work Map
+binding. The profile registry evaluates structure, binding, content, and
+freshness as independent axes. Profile acceptance means only that its required
+mechanical checks passed; it does not turn recorded validation facts into
+approval, release, product, or readiness evidence. Read
+[Adapter and Result Contract](references/adapter-schema.md) for compatibility
+omissions and supported conclusions.
+
+Use `audit-event ADAPTER --workspace WORKSPACE --event-manifest MANIFEST`
+only for a read-only audit of Event Manifest v2. It selects evidence solely
+through the explicit `closeout.current` pointer and
+`current_closeout_attempt()`, revalidates the bound Closeout receipt, Impact,
+Freeze, optional attestation, adapter, workspace, and current frozen content,
+and reports bounded supported and unsupported claims. It never scans for a
+newer-looking file, mutates the manifest, writes evidence, or installs a
+package. Event Manifest v1 returns `unproven` as unsupported rather than being
+guessed or upgraded.
+
+Use `verify-integration ADAPTER --workspace RECORDED_WORKSPACE
+--event-manifest MANIFEST --attestation ATTESTATION --target-workspace TARGET
+--target-adapter TARGET_ADAPTER` only as read-only, derived evidence after a
+closed batch is integrated. Supplying neither `--source-repository` nor
+`--source-ref` preserves the complete legacy path; supplying exactly one is a
+structured failure. With both supplied, `ADAPTER` and `--target-adapter` are
+strict repository-relative paths, source and target refs must be complete OIDs
+or full `refs/...` names, and the verifier observes one source commit directly
+from Git objects. That commit must have one sole parent equal to the manifest
+baseline, its no-rename baseline diff must exactly equal attested
+`actual_paths`, and its regular blobs must match the attested final content
+and adapter. A merge source is unsupported. If an existing attestation names
+`final_git_commit`, it must be that derived commit exactly. The recorded event
+workspace remains historical identity and may be absent: one Git-tree content
+observer rebinds final content and modern Validation Receipt freshness from
+the source objects. Explicit mode requires safely observable external v1/v2
+evidence when that workspace has been removed. Target history passes only when
+the target ref is the source commit or a descendant; directly observed
+contradictions fail, while unavailable Git objects, shallow/graft limits, and
+other insufficient evidence are `unproven`. `git-history` claims inherit only
+when every directly observable relation passes. The command rejects Git
+replacement/graft overlays and inherited Git redirection environments; it
+never approves integration, release, readiness, or status. Read
+[Integration Verification](references/integration-verification.md) for the
+consumer contract.
+
 ## Governed Batch
 
 A governed batch is a related set of changes with one clear goal that can be
@@ -137,6 +204,13 @@ paths warn. Path authorization permits bytes to change; it never approves
 product, architecture, release, or historical meaning. Protected, excluded,
 historical, and human-decision boundaries remain fail-closed.
 
+For a generated authorization list, use repeatable
+`--authorized-paths-from`; it has the strict path-file contract used by
+`--paths-from` but contributes only authorization, never changed or actual
+scope. Use `--compact` on Closeout or archive commands only when the consumer
+needs the bounded presentation schema. Full producer JSON remains the default
+and is required when an omitted command-specific field is needed.
+
 Return `pass` only when deterministic checks and required evidence agree;
 return `fail` for proven defects and `unproven` for insufficient evidence or a
 pending human decision. Follow the smallest reported recovery action. Do not
@@ -169,7 +243,9 @@ of these references only when its condition is present:
   [Controlled Archive Protocol](references/controlled-archive.md) before any
   archive operation. Archive review, stale-material checks, dependency
   analysis, candidate identification, and archive preflight are read-only; no
-  ordinary GAC command grants archive execution.
+  ordinary GAC command grants archive execution. New multi-operation summaries
+  use Task Summary v2 receipt references for verified successes; failures and
+  unknown outcomes retain complete diagnostic and recovery envelopes.
 
 ## Live Diagnostic And Mechanical Boundaries
 

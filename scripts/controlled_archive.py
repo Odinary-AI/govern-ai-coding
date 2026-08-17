@@ -18,7 +18,10 @@ from pathlib import Path
 EXECUTION_GRANT_SCHEMA = "govern-ai-coding.archive-execution-grant.v1"
 TASK_SCHEMA = "govern-ai-coding.archive-task.v1"
 TASK_GRANT_SCHEMA = "govern-ai-coding.archive-task-execution-grant.v1"
-TASK_SUMMARY_SCHEMA = "govern-ai-coding.archive-task-summary.v1"
+TASK_SUMMARY_SCHEMA_V1 = "govern-ai-coding.archive-task-summary.v1"
+TASK_SUMMARY_SCHEMA_V2 = "govern-ai-coding.archive-task-summary.v2"
+TASK_SUMMARY_SCHEMAS = {TASK_SUMMARY_SCHEMA_V1, TASK_SUMMARY_SCHEMA_V2}
+TASK_SUMMARY_SCHEMA = TASK_SUMMARY_SCHEMA_V2
 AMENDMENT_SCHEMA = "govern-ai-coding.archive-mapping-amendment.v1"
 NORMALIZED_RESULT_SCHEMA = "govern-ai-coding.normalized-result.v1"
 VERDICTS = {"pass", "fail", "unproven"}
@@ -30,7 +33,7 @@ REFERENCE_HANDLINGS = {
 HEX_256 = re.compile(r"^[0-9a-f]{64}$")
 
 
-def canonical_json_digest(payload: object) -> str:
+def canonical_archive_v1_digest(payload: object) -> str:
     encoded = json.dumps(
         payload,
         sort_keys=True,
@@ -515,7 +518,7 @@ def normalize_archive_result(payload: dict) -> dict:
     )
     changed = moved or (is_archive_receipt and verdict == "pass")
     is_task = (
-        payload.get("schema") in {TASK_SCHEMA, TASK_SUMMARY_SCHEMA}
+        payload.get("schema") in {TASK_SCHEMA, *TASK_SUMMARY_SCHEMAS}
         or payload.get("task_atomicity")
         == "non-atomic-independent-operations"
         or isinstance(payload.get("operations"), list)
@@ -633,7 +636,7 @@ def validate_execution_grant(
             })
     intent_findings, intent_unverified = _validate_intent_evidence(
         grant.get("intent_evidence"),
-        expected_scope_digest=canonical_json_digest(operation),
+        expected_scope_digest=canonical_archive_v1_digest(operation),
         code_prefix="archive-execution",
     )
     findings.extend(intent_findings)
@@ -930,7 +933,7 @@ def build_archive_preflight(
 ) -> dict:
     verdict = "fail" if findings else "unproven" if unverified else "pass"
     stable = {
-        "request_sha256": canonical_json_digest(request),
+        "request_sha256": canonical_archive_v1_digest(request),
         "mapping": mapping,
         "runtime_result": runtime.get("result"),
         "references": references,
@@ -948,7 +951,7 @@ def build_archive_preflight(
         "files_moved": [],
         "atomicity": "none-read-only",
         "request_sha256": stable["request_sha256"],
-        "preflight_sha256": canonical_json_digest(stable),
+        "preflight_sha256": canonical_archive_v1_digest(stable),
         "mapping": mapping,
         "approval_sha256": approval_digest,
         "runtime": runtime,
@@ -1117,7 +1120,7 @@ def global_archive_preflight(
             "receipt": operation.get("receipt"),
         }
         bindings = {
-            "request_sha256": canonical_json_digest(request),
+            "request_sha256": canonical_archive_v1_digest(request),
             "mapping": mapping,
         }
         for field, expected in bindings.items():
@@ -1153,7 +1156,7 @@ def global_archive_preflight(
             })
     result = "fail" if findings else "pass"
     stable = {
-        "manifest_sha256": canonical_json_digest(manifest),
+        "manifest_sha256": canonical_archive_v1_digest(manifest),
         "operation_preflight_sha256": [
             item.get("preflight_sha256") for item in operation_preflights
         ],
@@ -1171,7 +1174,7 @@ def global_archive_preflight(
         "atomicity": "none-read-only",
         "task_atomicity": "non-atomic-independent-operations",
         "manifest_sha256": stable["manifest_sha256"],
-        "preflight_sha256": canonical_json_digest(stable),
+        "preflight_sha256": canonical_archive_v1_digest(stable),
         "operation_preflights": operation_preflights,
         "runtime": runtime,
         "mechanical_findings": findings,
@@ -1223,7 +1226,7 @@ def validate_task_execution_grant(
     }
     intent_findings, intent_unverified = _validate_intent_evidence(
         grant.get("intent_evidence"),
-        expected_scope_digest=canonical_json_digest(intent_scope),
+        expected_scope_digest=canonical_archive_v1_digest(intent_scope),
         code_prefix="archive-task-execution",
     )
     findings.extend(intent_findings)
@@ -1276,7 +1279,7 @@ def validate_receipt_grant_binding(
         authorization.get("amendment_sha256")
         != refreshed.get("amendment_sha256")
         or authorization.get("grant_sha256")
-        != canonical_json_digest(refreshed)
+        != canonical_archive_v1_digest(refreshed)
     ):
         return [{"code": "archive-task-receipt-grant-mismatch"}]
     return []
@@ -1324,7 +1327,7 @@ def reconcile_archive_task(
                     view["verdict"] == "pass"
                     and view["changed"]
                     and receipt_mapping == expected_mapping
-                    and receipt.get("request_sha256") == canonical_json_digest(request)
+                    and receipt.get("request_sha256") == canonical_archive_v1_digest(request)
                     and not receipt_findings
                 ):
                     state = "completed-receipt-verified"
@@ -1337,11 +1340,11 @@ def reconcile_archive_task(
             preflight_passed = preflight.get("result") == "pass"
             states.append({
                 "id": identifier,
-                "request_sha256": canonical_json_digest(
+                "request_sha256": canonical_archive_v1_digest(
                     operation["request"]
                 ),
                 "receipt_sha256": (
-                    canonical_json_digest(receipt)
+                    canonical_archive_v1_digest(receipt)
                     if isinstance(receipt, dict)
                     else None
                 ),
@@ -1379,15 +1382,71 @@ def reconcile_archive_task(
         result = "unproven"
     return {
         "schema": TASK_SUMMARY_SCHEMA,
-        "schema_version": "1",
+        "schema_version": "2",
         "result": result,
         "phase": "task-summary",
-        "manifest_sha256": canonical_json_digest(manifest),
+        "manifest_sha256": canonical_archive_v1_digest(manifest),
         "atomicity": "non-atomic-independent-operations",
         "rollback_completed_operations": False,
         "operations": states,
         "mechanical_findings": findings,
     }
+
+
+def compact_archive_task_execution_results(
+    execution_results: list[dict],
+    receipt_bindings: list[dict],
+) -> list[dict]:
+    bindings: dict[str, dict] = {}
+    for binding in receipt_bindings:
+        if not isinstance(binding, dict):
+            continue
+        identifier = binding.get("operation")
+        path = binding.get("path")
+        digest = binding.get("sha256")
+        if (
+            isinstance(identifier, str)
+            and identifier
+            and isinstance(path, str)
+            and path
+            and isinstance(digest, str)
+            and HEX_256.match(digest) is not None
+            and identifier not in bindings
+        ):
+            bindings[identifier] = {"path": path, "sha256": digest}
+
+    compacted: list[dict] = []
+    for entry in execution_results:
+        copied = json.loads(json.dumps(entry))
+        if not isinstance(entry, dict):
+            compacted.append(copied)
+            continue
+        identifier = entry.get("id")
+        binding = bindings.get(identifier)
+        result = entry.get("result")
+        success = (
+            entry.get("state") == "completed-receipt-verified"
+            and binding is not None
+            and (
+                result is None
+                or isinstance(result, dict) and result.get("result") == "pass"
+            )
+        )
+        if not success:
+            compacted.append(copied)
+            continue
+        compact_entry = {
+            "id": identifier,
+            "state": "completed-receipt-verified",
+            "skipped": entry.get("skipped") is True,
+            "receipt": binding,
+        }
+        if isinstance(result, dict):
+            compact_entry["execution_result_sha256"] = canonical_archive_v1_digest(
+                result
+            )
+        compacted.append(compact_entry)
+    return compacted
 
 
 def _archive_receipt_completion_findings(
@@ -1462,7 +1521,7 @@ def _archive_receipt_completion_findings(
         and receipt.get("derived_evidence") is True
         and receipt.get("generated") is True
         and receipt.get("project_authority") is False
-        and receipt.get("request_sha256") == canonical_json_digest(request)
+        and receipt.get("request_sha256") == canonical_archive_v1_digest(request)
         and receipt.get("mapping") == mapping
         and isinstance(content, dict)
         and content.get("unchanged") is True

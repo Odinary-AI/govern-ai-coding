@@ -29,7 +29,13 @@ Ask:
 3. Do current authorities agree with the available evidence?
 4. What remains uncertain?
 
-Each finding contains:
+The review is a JSON object with schema
+`govern-ai-coding.semantic-review.v1`, the four answers, and a `findings`
+array. Use the packaged
+[`semantic-review-example.json`](semantic-review-example.json) as the complete
+copyable shape.
+
+Each finding contains these required core fields:
 
 - `code`
 - `affected_question`
@@ -38,6 +44,26 @@ Each finding contains:
 - `decision_boundary`
 - `suggested_handling`
 - `human_boundary`
+- `status`
+
+Every core field except `human_boundary` is a non-empty string;
+`human_boundary` is a JSON boolean. `status` is exactly `resolved` or
+`unresolved`. A resolved finding also requires non-empty string `resolution`
+and `resolution_evidence`. An unresolved finding may omit both; if either is
+present it must be a non-empty string.
+
+Each answer is a non-empty string or a non-empty list of non-empty strings.
+
+Run shape-only preflight before binding the review to a governed event:
+
+```bash
+python3 scripts/govern_ai_coding.py validate-semantic-review REVIEW.json
+```
+
+A preflight pass proves only that the JSON shape is valid. It does not prove
+that resolution evidence is part of or authorized for the event, that an
+unresolved finding is resolved, or that a human decision exists. Closeout owns
+those contextual checks through `--semantic-review`.
 
 Bind required review with `--semantic-review REVIEW.json`. Missing, malformed,
 unresolved, or unhandled required review keeps Closeout from passing.

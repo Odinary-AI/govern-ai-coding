@@ -15,6 +15,12 @@ Work Map item, an unfinished configured dependency, or trusted peer evidence
 that changed a declared baseline input. Authority-rule overlap warns and stays
 `unproven`; incomplete peer evidence cannot manufacture a conflict.
 
+V1 peer evidence uses `receipts.closeout_attestation`. V2 peer evidence is
+eligible only through the mechanically valid `closeout.current` attempt. The
+preflight never selects another attempt or a neighboring evidence file.
+Relative `event.workspace` values resolve from each supplied manifest's own
+directory, for both the current event and peers.
+
 The command inspects only supplied declarations. It does not discover sessions,
 tasks, processes, branches, or worktrees and does not schedule, lock, merge, or
 modify anything. Its result says nothing about concurrent work that was not

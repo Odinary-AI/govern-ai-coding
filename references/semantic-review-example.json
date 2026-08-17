@@ -1,0 +1,29 @@
+{
+  "schema": "govern-ai-coding.semantic-review.v1",
+  "source": {
+    "kind": "governed-batch",
+    "path": "docs/design/example.md"
+  },
+  "answers": {
+    "important_claims_changed": "The example runtime contract changed.",
+    "affected_questions": [
+      "runtime.contract"
+    ],
+    "documents_agree_with_evidence": "The current authority and implementation evidence agree for the bounded example.",
+    "remaining_uncertainty": "External adoption is not proven by this review."
+  },
+  "findings": [
+    {
+      "code": "example-contract-change",
+      "affected_question": "runtime.contract",
+      "evidence": "tests/example_contract_test.py",
+      "confidence": "high",
+      "decision_boundary": "runtime contract",
+      "suggested_handling": "Bind the approved design and affected validation.",
+      "human_boundary": false,
+      "status": "resolved",
+      "resolution": "The implementation follows the approved bounded contract.",
+      "resolution_evidence": "docs/reports/example-validation.md"
+    }
+  ]
+}

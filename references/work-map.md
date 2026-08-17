@@ -35,6 +35,10 @@ attestation without `work_map_observation` remains readable but cannot prove
 current Work Map closure. Historical `govern-project-docs` attestations remain
 evidence only.
 
+With Event Manifest v2, status obtains the attestation only through the valid
+`closeout.current` attempt. Event Manifest v1 keeps the existing
+`receipts.closeout_attestation` behavior.
+
 Read [Adapter and Result Contract](adapter-schema.md) for the complete adapter,
 manifest, validation-receipt, and observation schemas. Read
 [Closeout Attestation](closeout-attestation.md) only when immutable proof is a

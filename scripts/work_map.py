@@ -583,6 +583,7 @@ def classify_attestation(
     adapter: dict | None = None,
     workspace: Path | None = None,
     manifest: dict | None = None,
+    manifest_path: Path | None = None,
 ) -> dict:
     """Classify attestation evidence without treating historical evidence as closure."""
     schemas = config.get("attestations", {})
@@ -636,6 +637,7 @@ def classify_attestation(
         adapter=adapter,
         workspace=workspace,
         manifest=manifest,
+        manifest_path=manifest_path,
     )
     if bound.get("status") != "matching":
         return {
@@ -660,6 +662,7 @@ def work_map_status(
     workspace: Path,
     binding: dict,
     manifest: dict | None = None,
+    manifest_path: Path | None = None,
 ) -> dict:
     """Derive bounded Work Map closure status using only current read-only evidence."""
     observation, findings = observe_work_map_final(adapter, workspace, binding)
@@ -695,6 +698,7 @@ def work_map_status(
             adapter=adapter,
             workspace=workspace,
             manifest=manifest,
+            manifest_path=manifest_path,
         )
     else:
         attestation = {"status": "evidence-incomplete", "path": None}
